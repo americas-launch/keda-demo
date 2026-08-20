@@ -1,0 +1,12 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: keda-demo-orders
+  namespace: lightwell-infra
+  labels:
+    strimzi.io/cluster: lightwell
+spec:
+  partitions: 10
+  replicas: 1
+  config:
+    retention.ms: "600000"

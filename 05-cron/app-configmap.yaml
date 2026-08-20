@@ -1,0 +1,1417 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-app-code
+  namespace: keda-demo
+data:
+  server.py: |
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from socketserver import ThreadingMixIn
+    import json, math, os, random, ssl, threading, time, urllib.request, urllib.error, datetime
+
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    hostname = os.environ.get('HOSTNAME', 'unknown')
+    namespace = 'keda-demo'
+    start_time = time.time()
+
+    MAX_CONCURRENT = 50
+    SOFT_LIMIT = 5
+    MAX_REJECT_PROB = 0.15
+    concurrent = {'count': 0, 'lock': threading.Lock()}
+    stats = {
+        'total': 0, 'success': 0, 'rejected': 0,
+        'total_ms': 0, 'lock': threading.Lock(),
+    }
+    surge_state = {'target': 0, 'running': 0, 'lock': threading.Lock()}
+
+    SVC_URL = 'http://trading-app.keda-demo.svc.cluster.local:8080/burn'
+    MAX_SURGE_THREADS = 50
+
+    def surge_worker():
+        with surge_state['lock']:
+            surge_state['running'] += 1
+        try:
+            while True:
+                with surge_state['lock']:
+                    if surge_state['running'] > surge_state['target']:
+                        surge_state['running'] -= 1
+                        return
+                try:
+                    req = urllib.request.Request(SVC_URL)
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        pass
+                    with stats['lock']:
+                        stats['total'] += 1
+                        stats['success'] += 1
+                except urllib.error.HTTPError as e:
+                    with stats['lock']:
+                        stats['total'] += 1
+                        if e.code == 503:
+                            stats['rejected'] += 1
+                except Exception:
+                    time.sleep(0.1)
+                time.sleep(1)
+        except Exception:
+            with surge_state['lock']:
+                surge_state['running'] -= 1
+
+    def set_surge_threads(n):
+        n = max(0, min(n, MAX_SURGE_THREADS))
+        with surge_state['lock']:
+            surge_state['target'] = n
+            needed = n - surge_state['running']
+        for _ in range(max(0, needed)):
+            threading.Thread(target=surge_worker, daemon=True).start()
+
+    K8S_HOST = 'https://kubernetes.default.svc'
+    TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+    CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+
+    def k8s_request(method, path, body=None):
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        ctx = ssl.create_default_context(cafile=CA_PATH)
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(
+            f'{K8S_HOST}{path}',
+            data=data,
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/merge-patch+json',
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def k8s_get(path):
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        ctx = ssl.create_default_context(cafile=CA_PATH)
+        req = urllib.request.Request(
+            f'{K8S_HOST}{path}',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def get_pods():
+        data = k8s_get(f'/api/v1/namespaces/{namespace}/pods?labelSelector=app%3Dtrading-app')
+        pods = []
+        for item in data.get('items', []):
+            meta = item['metadata']
+            status = item['status']
+            phase = status.get('phase', 'Unknown')
+            if meta.get('deletionTimestamp'):
+                phase = 'Terminating'
+            cs = status.get('containerStatuses', [])
+            ready = cs[0].get('ready', False) if cs else False
+            restarts = cs[0].get('restartCount', 0) if cs else 0
+            pods.append({
+                'name': meta['name'],
+                'phase': phase,
+                'ready': ready,
+                'restarts': restarts,
+                'created': meta.get('creationTimestamp', ''),
+                'is_me': meta['name'] == hostname,
+            })
+        pods.sort(key=lambda p: p['created'])
+        return pods
+
+    def get_deployment():
+        data = k8s_get(f'/apis/apps/v1/namespaces/{namespace}/deployments/trading-app')
+        s = data.get('status', {})
+        return {
+            'desired': data.get('spec', {}).get('replicas', 0),
+            'ready': s.get('readyReplicas', 0),
+            'available': s.get('availableReplicas', 0),
+        }
+
+    def get_keda_status():
+        try:
+            data = k8s_get(f'/apis/keda.sh/v1alpha1/namespaces/{namespace}/scaledobjects/trading-app-scaler')
+            annotations = data.get('metadata', {}).get('annotations', {})
+            paused = annotations.get('autoscaling.keda.sh/paused', 'false') == 'true'
+            triggers = data.get('spec', {}).get('triggers', [])
+            cron_info = None
+            for t in triggers:
+                if t.get('type') == 'cron':
+                    cron_info = t.get('metadata', {})
+                    break
+            return {'exists': True, 'paused': paused, 'cron': cron_info}
+        except Exception:
+            return {'exists': False, 'paused': True, 'cron': None}
+
+    def k8s_delete(path):
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        ctx = ssl.create_default_context(cafile=CA_PATH)
+        req = urllib.request.Request(
+            f'{K8S_HOST}{path}',
+            headers={'Authorization': f'Bearer {token}'},
+            method='DELETE',
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def k8s_create(path, body):
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        ctx = ssl.create_default_context(cafile=CA_PATH)
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            f'{K8S_HOST}{path}',
+            data=data,
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def build_scaled_object_spec():
+        now = datetime.datetime.utcnow()
+        start_h = now.hour
+        end_h = (now.hour + 3) % 24
+        if end_h <= start_h:
+            end_h = 23
+        return {
+            'apiVersion': 'keda.sh/v1alpha1',
+            'kind': 'ScaledObject',
+            'metadata': {'name': 'trading-app-scaler', 'namespace': namespace},
+            'spec': {
+                'scaleTargetRef': {'name': 'trading-app'},
+                'pollingInterval': 15,
+                'cooldownPeriod': 300,
+                'minReplicaCount': 1,
+                'maxReplicaCount': 20,
+                'triggers': [{
+                    'type': 'cron',
+                    'metadata': {
+                        'timezone': 'Etc/UTC',
+                        'start': f'0 {start_h} * * *',
+                        'end': f'0 {end_h} * * *',
+                        'desiredReplicas': '10',
+                    },
+                }],
+            },
+        }
+
+    def create_scaled_object():
+        spec = build_scaled_object_spec()
+        k8s_create(f'/apis/keda.sh/v1alpha1/namespaces/{namespace}/scaledobjects', spec)
+
+    def delete_scaled_object():
+        k8s_delete(f'/apis/keda.sh/v1alpha1/namespaces/{namespace}/scaledobjects/trading-app-scaler')
+
+    HTML = r'''<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>KEDA Cron Scaling — Wall Street</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@400;500;600;700;800;900&family=Red+Hat+Mono:wght@400;500;600;700&display=swap');
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #06080f; --surface: rgba(255,255,255,.04); --surface-2: rgba(255,255,255,.07);
+      --border: rgba(255,255,255,.08); --border-hover: rgba(255,255,255,.15);
+      --text: #eef0f6; --text-dim: rgba(255,255,255,.45);
+      --accent: #818cf8; --accent-soft: rgba(129,140,248,.12);
+      --green: #34d399; --green-soft: rgba(52,211,153,.12);
+      --amber: #fbbf24; --amber-soft: rgba(251,191,36,.12);
+      --red: #fb7185; --red-soft: rgba(251,113,133,.12);
+      --cyan: #22d3ee; --cyan-soft: rgba(34,211,238,.12);
+      --gold: #f59e0b; --gold-soft: rgba(245,158,11,.12);
+      --radius: 16px; --radius-sm: 10px;
+    }
+    body {
+      font-family: 'Red Hat Display', -apple-system, system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(245,158,11,.06), transparent),
+        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(251,113,133,.05), transparent);
+    }
+    .app { max-width: 85%; margin: 0 auto; padding: 2rem 2.5rem 3rem; }
+    .main-layout { display: grid; grid-template-columns: 1fr 260px; gap: 1.25rem; align-items: start; }
+    .main-content { min-width: 0; }
+    .pods-sidebar {
+      position: sticky; top: 1.5rem;
+      max-height: calc(100vh - 3rem); overflow-y: auto;
+      scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.1) transparent;
+    }
+    .pods-sidebar::-webkit-scrollbar { width: 4px; }
+    .pods-sidebar::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 4px; }
+    .pods-sidebar .section-title { font-size: .8rem; }
+
+    header { text-align: center; margin-bottom: 2rem; }
+    header img { height: 44px; margin-bottom: 1rem; filter: drop-shadow(0 0 20px rgba(255,255,255,.08)); }
+    header h1 { font-size: 2rem; font-weight: 800; letter-spacing: -0.03em; margin-bottom: .35rem; }
+    header h1 em { font-style: normal; background: linear-gradient(135deg, var(--gold), var(--amber)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    header p { color: var(--text-dim); font-size: .9rem; font-weight: 400; }
+
+    .market-clock {
+      display: flex; align-items: center; justify-content: center; gap: 1.25rem;
+      margin-top: 1rem;
+    }
+    .et-time {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.6rem; font-weight: 700;
+      color: var(--text); letter-spacing: .02em;
+    }
+    .market-badge {
+      font-size: .65rem; font-weight: 700; text-transform: uppercase; letter-spacing: .1em;
+      padding: .3rem .8rem; border-radius: 20px;
+    }
+    .market-badge.pre { background: var(--amber-soft); color: var(--amber); }
+    .market-badge.open { background: var(--green-soft); color: var(--green); }
+    .market-badge.after { background: var(--accent-soft); color: var(--accent); }
+    .market-badge.closed { background: var(--red-soft); color: var(--red); }
+    .bell-countdown {
+      font-family: 'Red Hat Mono', monospace; font-size: .85rem; color: var(--text-dim);
+    }
+
+    .glass {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 1.25rem;
+      backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+      transition: border-color .2s;
+    }
+    .glass:hover { border-color: var(--border-hover); }
+
+    .stat-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; margin-bottom: 1.25rem; }
+
+    .gauge-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .5rem; }
+    .gauge {
+      position: relative; width: 150px; height: 150px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 1.5s ease;
+    }
+    .gauge-inner {
+      width: 120px; height: 120px; border-radius: 50%;
+      background: var(--bg); display: flex; flex-direction: column;
+      align-items: center; justify-content: center; position: relative; z-index: 1;
+    }
+    .gauge-pct {
+      font-family: 'Red Hat Mono', monospace; font-size: 2rem; font-weight: 700;
+      line-height: 1;
+    }
+    .gauge-pct-label { font-size: .55rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .08em; margin-top: .2rem; }
+    .gauge-legend {
+      display: flex; gap: 1.25rem; font-size: .85rem; color: var(--text-dim); font-weight: 500;
+    }
+    .gauge-legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: .3rem; vertical-align: middle; }
+
+    .card-label {
+      font-size: .6rem; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--text-dim); margin-bottom: .5rem; font-weight: 600;
+    }
+    .card-value {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.8rem; font-weight: 700; line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .card-sub { font-size: .7rem; color: var(--text-dim); margin-top: .3rem; }
+    .so-status {
+      display: inline-flex; align-items: center; gap: .4rem;
+      font-family: 'Red Hat Mono', monospace; font-size: .9rem; font-weight: 600; margin-top: .3rem;
+    }
+    .so-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .so-status.active { color: var(--green); }
+    .so-status.active .so-dot { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .so-status.missing { color: var(--red); }
+    .so-status.missing .so-dot { background: var(--red); box-shadow: 0 0 6px var(--red); }
+    .ticker-card { overflow: hidden; }
+    .ticker {
+      display: flex; justify-content: center; gap: 0;
+      font-family: 'Red Hat Mono', monospace; font-size: 1.8rem; font-weight: 700;
+      line-height: 1; font-variant-numeric: tabular-nums;
+    }
+    .ticker-slot {
+      position: relative; overflow: hidden;
+      width: 1.15em; height: 1.3em;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .ticker-slot.digit {
+      background: rgba(255,255,255,.04); border-radius: 4px;
+      margin: 0 1px; border: 1px solid rgba(255,255,255,.08);
+      box-shadow: inset 0 1px 2px rgba(0,0,0,.3);
+    }
+    .ticker-ch { display: block; }
+    .roll-enter-active, .roll-leave-active { transition: all .3s ease; }
+    .roll-enter-from { transform: translateY(100%); opacity: 0; }
+    .roll-leave-to { transform: translateY(-100%); opacity: 0; }
+    .v-green { color: var(--green); }
+    .v-red { color: var(--red); }
+    .v-amber { color: var(--amber); }
+    .v-accent { color: var(--accent); }
+    .v-gold { color: var(--gold); }
+
+    .keda-panel { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .8rem; text-align: center; }
+    .keda-badge {
+      display: inline-flex; align-items: center; gap: .5rem;
+      font-size: .8rem; font-weight: 600;
+      padding: .35rem .9rem; border-radius: 20px;
+    }
+    .keda-badge.off { background: var(--red-soft); color: var(--red); }
+    .keda-badge.on { background: var(--green-soft); color: var(--green); }
+    .keda-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .keda-badge.off .keda-dot { background: var(--red); }
+    .keda-badge.on .keda-dot { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse-glow 2s infinite; }
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 4px var(--green); }
+      50% { box-shadow: 0 0 14px var(--green); }
+    }
+
+    .toggle-wrap { display: flex; align-items: center; gap: .75rem; cursor: pointer; }
+    .toggle-label {
+      font-family: 'Red Hat Display', sans-serif; font-size: .75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim);
+      transition: color .3s;
+    }
+    .toggle-wrap.on .toggle-label { color: var(--green); }
+    .toggle-wrap.off .toggle-label { color: var(--red); }
+    .toggle-track {
+      width: 56px; height: 30px; border-radius: 15px;
+      position: relative; transition: background .3s, box-shadow .3s;
+      flex-shrink: 0;
+    }
+    .toggle-wrap.off .toggle-track {
+      background: linear-gradient(135deg, #ef4444, var(--red));
+      box-shadow: 0 2px 12px rgba(251,113,133,.25);
+    }
+    .toggle-wrap.on .toggle-track {
+      background: linear-gradient(135deg, #10b981, var(--green));
+      box-shadow: 0 2px 12px rgba(52,211,153,.3);
+    }
+    .toggle-thumb {
+      width: 24px; height: 24px; border-radius: 50%;
+      background: #fff; position: absolute; top: 3px;
+      transition: left .3s cubic-bezier(.4,0,.2,1);
+      box-shadow: 0 1px 4px rgba(0,0,0,.3);
+    }
+    .toggle-wrap.off .toggle-thumb { left: 3px; }
+    .toggle-wrap.on .toggle-thumb { left: 29px; }
+
+    .schedule-card {
+      display: flex; align-items: center; gap: 1.5rem;
+      padding: .8rem 1.5rem; margin-bottom: 1.25rem;
+    }
+    .schedule-info { flex: 1; }
+    .schedule-row {
+      display: flex; align-items: center; gap: .75rem; margin-bottom: .5rem;
+    }
+    .schedule-row:last-child { margin-bottom: 0; }
+    .schedule-label {
+      font-size: .55rem; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--text-dim); font-weight: 600; min-width: 75px;
+    }
+    .schedule-value {
+      font-family: 'Red Hat Mono', monospace; font-size: .85rem; font-weight: 600;
+    }
+    .schedule-note {
+      font-size: .65rem; color: var(--text-dim); font-style: italic; margin-top: .5rem;
+    }
+    .schedule-divider {
+      width: 1px; height: 60px; background: var(--border); flex-shrink: 0;
+    }
+    .schedule-status { text-align: center; min-width: 110px; }
+    .schedule-status-label {
+      font-size: .55rem; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--text-dim); font-weight: 600; margin-bottom: .3rem;
+    }
+    .schedule-status-value {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.1rem; font-weight: 700;
+    }
+
+    .surge-bar {
+      display: flex; align-items: center; gap: 2rem;
+      padding: .8rem 1.5rem; margin-bottom: 1.25rem;
+    }
+    .surge-bar-left {
+      flex: 1; display: flex; flex-direction: column; align-items: center; gap: .4rem;
+    }
+    .surge-rate {
+      text-align: center; padding: .5rem 1.2rem; border-left: 1px solid var(--border); min-width: 90px;
+    }
+    .surge-rate-value {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.6rem; font-weight: 700; line-height: 1;
+    }
+    .surge-rate-label {
+      font-size: .6rem; text-transform: uppercase; letter-spacing: .1em; color: var(--text-dim); margin-top: .2rem;
+    }
+    .surge-bar-label {
+      font-size: .55rem; text-transform: uppercase; letter-spacing: .12em;
+      color: var(--text-dim); font-weight: 600;
+    }
+    .surge-bar-row {
+      display: flex; align-items: center; gap: .75rem; width: 100%;
+    }
+    .surge-bar-off, .surge-bar-max {
+      font-size: .6rem; text-transform: uppercase; letter-spacing: .08em;
+      color: var(--text-dim); white-space: nowrap; font-weight: 600;
+    }
+    .surge-bar-value {
+      font-family: 'Red Hat Mono', monospace; font-size: .75rem; font-weight: 600;
+    }
+    .v-dim { color: var(--text-dim); }
+    .surge-slider {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 8px; border-radius: 4px;
+      background: linear-gradient(90deg, var(--green) 0%, var(--amber) 40%, var(--red) 100%);
+      outline: none; cursor: pointer;
+    }
+    .surge-slider::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 22px; height: 22px; border-radius: 50%;
+      background: #fff; border: 2px solid rgba(255,255,255,.3);
+      box-shadow: 0 2px 8px rgba(0,0,0,.4), 0 0 12px rgba(245,158,11,.3);
+      cursor: grab; transition: box-shadow .2s;
+    }
+    .surge-slider::-webkit-slider-thumb:hover {
+      box-shadow: 0 2px 12px rgba(0,0,0,.5), 0 0 20px rgba(245,158,11,.5);
+    }
+    .surge-slider::-moz-range-thumb {
+      width: 22px; height: 22px; border-radius: 50%;
+      background: #fff; border: 2px solid rgba(255,255,255,.3);
+      box-shadow: 0 2px 8px rgba(0,0,0,.4), 0 0 12px rgba(245,158,11,.3);
+      cursor: grab;
+    }
+
+    .btn-bell {
+      border: none; border-radius: var(--radius-sm); padding: 1rem 2rem;
+      font-family: 'Red Hat Display', sans-serif; font-size: 1rem; font-weight: 900; cursor: pointer;
+      background: linear-gradient(135deg, #f59e0b, #d97706, #b45309);
+      color: #fff; text-transform: uppercase; letter-spacing: .08em;
+      transition: all .2s; position: relative; overflow: hidden;
+      border: 1px solid rgba(245,158,11,.3);
+    }
+    .btn-bell::before {
+      content: ''; position: absolute; inset: 0;
+      background: linear-gradient(135deg, transparent 30%, rgba(255,255,255,.15) 50%, transparent 70%);
+      transform: translateX(-100%); transition: transform .6s;
+    }
+    .btn-bell:hover::before { transform: translateX(100%); }
+    .btn-bell:hover { box-shadow: 0 8px 40px rgba(245,158,11,.3); transform: translateY(-2px); }
+    .btn-bell:active { transform: scale(.97); }
+    .btn-bell.ringing {
+      background: linear-gradient(135deg, #92400e, #78350f);
+      box-shadow: 0 0 20px rgba(245,158,11,.15);
+      animation: bell-pulse 1.5s ease infinite;
+    }
+    @keyframes bell-pulse {
+      0%, 100% { box-shadow: 0 0 15px rgba(245,158,11,.1); }
+      50% { box-shadow: 0 0 30px rgba(245,158,11,.25); }
+    }
+
+    .section { margin-bottom: 1.25rem; }
+    .section-title {
+      font-size: .85rem; font-weight: 700; margin-bottom: .75rem;
+      display: flex; align-items: center; gap: .5rem;
+    }
+    .badge {
+      font-family: 'Red Hat Mono', monospace; background: var(--surface-2);
+      border: 1px solid var(--border); padding: .15rem .5rem; border-radius: 8px;
+      font-size: .65rem; color: var(--text-dim); font-weight: 500;
+    }
+    .btn-flat {
+      border: none; border-radius: 6px; padding: .25rem .7rem;
+      font-family: 'Red Hat Display', sans-serif; font-size: .65rem; font-weight: 600;
+      cursor: pointer; background: var(--surface-2); color: var(--text-dim);
+      border: 1px solid var(--border); text-transform: uppercase; letter-spacing: .04em;
+      margin-left: auto; transition: all .15s;
+    }
+    .btn-flat:hover { border-color: var(--amber); color: var(--amber); }
+
+    .pods-grid { display: flex; flex-direction: column; gap: .5rem; }
+    .pod-card {
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: .85rem;
+      transition: all .3s cubic-bezier(.4,0,.2,1);
+    }
+    .pod-enter { animation: pod-in .4s cubic-bezier(.4,0,.2,1); }
+    @keyframes pod-in { from { opacity: 0; transform: translateY(8px) scale(.96); } }
+    .pod-card.me { border-color: rgba(129,140,248,.3); background: rgba(129,140,248,.06); }
+    .pod-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: .4rem; }
+    .pod-name {
+      font-family: 'Red Hat Mono', monospace; font-size: .65rem;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px;
+    }
+    .pod-me {
+      font-size: .5rem; font-weight: 700; background: var(--accent-soft);
+      border: 1px solid rgba(129,140,248,.25); color: var(--accent);
+      padding: .1rem .3rem; border-radius: 4px; margin-left: .3rem;
+    }
+    .pod-phase {
+      font-size: .55rem; text-transform: uppercase; letter-spacing: .06em;
+      padding: .15rem .45rem; border-radius: 4px; font-weight: 700;
+    }
+    .pod-phase.running { background: var(--green-soft); color: var(--green); }
+    .pod-phase.pending { background: var(--amber-soft); color: var(--amber); }
+    .pod-phase.containercreating { background: var(--cyan-soft); color: var(--cyan); }
+    .pod-phase.terminating { background: var(--red-soft); color: var(--red); }
+    .pod-info { font-size: .65rem; color: var(--text-dim); display: flex; gap: .75rem; align-items: center; }
+    .pod-dot-indicator { width: 5px; height: 5px; border-radius: 50%; display: inline-block; margin-right: .2rem; }
+    .pod-dot-indicator.up { background: var(--green); box-shadow: 0 0 4px var(--green); }
+    .pod-dot-indicator.down { background: var(--amber); animation: blink 1s infinite; }
+    @keyframes blink { 50% { opacity: .3; } }
+
+    .live-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem; }
+    .live-stat {
+      background: var(--surface); border-radius: var(--radius-sm); padding: .85rem;
+      text-align: center; border: 1px solid var(--border); transition: all .4s ease;
+    }
+    .live-stat.rate-ok {
+      border-color: rgba(52,211,153,.4); background: rgba(52,211,153,.06);
+      box-shadow: 0 0 20px rgba(52,211,153,.08);
+    }
+    .live-stat.rate-exceeded {
+      border-color: rgba(251,113,133,.5); background: rgba(251,113,133,.1);
+      box-shadow: 0 0 25px rgba(251,113,133,.15);
+      animation: rate-pulse 1.5s ease infinite;
+    }
+    @keyframes rate-pulse {
+      0%, 100% { box-shadow: 0 0 20px rgba(251,113,133,.1); }
+      50% { box-shadow: 0 0 35px rgba(251,113,133,.25); }
+    }
+    .live-stat-value {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.5rem; font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .live-stat-label { font-size: .55rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin-top: .25rem; font-weight: 600; }
+
+    .error-bar-wrap { margin-top: .75rem; grid-column: 1 / -1; }
+    .error-bar-label { font-size: .65rem; color: var(--text-dim); margin-bottom: .35rem; display: flex; justify-content: space-between; font-weight: 500; }
+    .error-bar-bg { background: var(--surface-2); border-radius: 6px; height: 8px; overflow: hidden; }
+    .error-bar-fill { height: 100%; border-radius: 6px; transition: width .4s cubic-bezier(.4,0,.2,1), background .3s; }
+    .error-bar-fill.low { background: linear-gradient(90deg, var(--green), #6ee7b7); }
+    .error-bar-fill.med { background: linear-gradient(90deg, var(--amber), #fcd34d); }
+    .error-bar-fill.high { background: linear-gradient(90deg, var(--red), #fda4af); }
+
+    .chart-wrap { margin-top: 1rem; grid-column: 1 / -1; }
+    .chart-wrap canvas { width: 100% !important; height: 140px !important; }
+
+    .timeline-box {
+      max-height: 140px; overflow-y: auto;
+      font-family: 'Red Hat Mono', monospace; font-size: .68rem;
+      line-height: 1.7; padding: .7rem; background: var(--surface-2); border-radius: var(--radius-sm);
+    }
+    .ev { display: flex; gap: .5rem; }
+    .ev .t { color: var(--text-dim); opacity: .4; white-space: nowrap; }
+    .ev.added .m { color: var(--green); }
+    .ev.removed .m { color: var(--red); }
+    .ev.info .m { color: var(--cyan); }
+    .ev.warn .m { color: var(--amber); }
+    .ev.bell .m { color: var(--gold); font-weight: 600; }
+
+    .fade-enter-active { transition: all .3s ease; }
+    .fade-enter-from { opacity: 0; transform: translateY(4px); }
+
+    .walkthrough { margin-bottom: 1.25rem; }
+    .wt-steps { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: .75rem; }
+    .wt-step {
+      display: flex; gap: .75rem; padding: 1rem;
+      background: var(--surface-2); border-radius: var(--radius-sm);
+      border: 1px solid var(--border); transition: all .4s ease;
+      opacity: .45;
+    }
+    .wt-step.active {
+      opacity: 1;
+      border-color: rgba(245,158,11,.4);
+      background: rgba(245,158,11,.04);
+      box-shadow: 0 0 20px rgba(245,158,11,.08);
+    }
+    .wt-step.done {
+      opacity: .7;
+      border-color: rgba(52,211,153,.3);
+      background: rgba(52,211,153,.03);
+    }
+    .wt-num {
+      width: 28px; height: 28px; border-radius: 50%;
+      background: var(--surface); border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-family: 'Red Hat Mono', monospace; font-size: .85rem; font-weight: 700;
+      flex-shrink: 0; color: var(--text-dim);
+    }
+    .wt-step.active .wt-num {
+      background: var(--gold-soft); border-color: rgba(245,158,11,.3);
+      color: var(--gold);
+    }
+    .wt-step.done .wt-num {
+      background: var(--green-soft); border-color: rgba(52,211,153,.3);
+      color: var(--green);
+    }
+    .wt-label { font-size: .85rem; font-weight: 700; margin-bottom: .25rem; }
+    .wt-desc { font-size: .75rem; color: var(--text-dim); line-height: 1.5; }
+    .wt-desc strong { color: var(--gold); font-weight: 700; }
+    .wt-result {
+      margin-top: .4rem; font-family: 'Red Hat Mono', monospace;
+      font-size: .8rem; font-weight: 600;
+    }
+    .wt-punchline {
+      text-align: center; margin-top: .75rem; padding: .6rem;
+      font-size: .85rem; font-weight: 600; color: var(--text-dim);
+      border-top: 1px solid var(--border);
+    }
+    .wt-punchline.visible { color: var(--green); }
+    .wt-punchline strong { color: var(--gold); font-weight: 800; }
+
+    @media (max-width: 900px) {
+      .app { padding: 1.25rem; max-width: 100%; }
+      .main-layout { grid-template-columns: 1fr; }
+      .pods-sidebar { position: static; max-height: none; }
+      .pods-grid { flex-direction: row; flex-wrap: wrap; }
+      .pods-grid .pod-card { flex: 1 1 200px; }
+      .stat-cards { grid-template-columns: repeat(2, 1fr); }
+      .live-stats { grid-template-columns: repeat(3, 1fr); }
+    }
+    </style>
+    </head>
+    <body>
+    <div id="app">
+      <div class="app">
+        <header>
+          <img src="/logo.png" alt="Red Hat">
+          <h1><em>KEDA</em> Cron Scaling Demo</h1>
+          <p>Pre-scaling for predictable demand — The Wall Street Opening Bell</p>
+          <div class="market-clock">
+            <span class="et-time">{{ etTime }}</span>
+            <span :class="['market-badge', marketPhase]">{{ marketStatusText }}</span>
+            <span class="bell-countdown" v-if="bellCountdown">{{ bellCountdown }}</span>
+          </div>
+        </header>
+
+        <div class="glass walkthrough">
+          <div class="card-label">Try It — See the Difference</div>
+          <div class="wt-steps">
+            <div :class="['wt-step', {active: !scaledObjectExists && !step1Done, done: step1Done}]">
+              <div class="wt-num">{{ step1Done ? '&#x2713;' : '1' }}</div>
+              <div class="wt-body">
+                <div class="wt-label">Without KEDA</div>
+                <div class="wt-desc">Click <strong>Simulate 9:30</strong>. With only 1 pod, orders get rejected. Click <strong>Stop</strong> when you've seen enough.</div>
+                <div class="wt-result v-red" v-if="step1Done">{{ step1Rej }} rejected of {{ step1Total }}</div>
+              </div>
+            </div>
+            <div :class="['wt-step', {active: scaledObjectExists && !step2Done, done: step2Done}]">
+              <div class="wt-num">{{ step2Done ? '&#x2713;' : '2' }}</div>
+              <div class="wt-body">
+                <div class="wt-label">With KEDA Cron</div>
+                <div class="wt-desc">Toggle <strong>KEDA on</strong>. Wait for pods to reach 10. Click <strong>Simulate 9:30</strong> again — zero rejections.</div>
+                <div class="wt-result v-green" v-if="step2Done">{{ step2Rej }} rejected of {{ step2Total }}</div>
+              </div>
+            </div>
+          </div>
+          <div :class="['wt-punchline', {visible: step2Done}]">
+            <span v-if="step2Done"><strong>Same load. Different outcome.</strong> The cron trigger had your pods ready before the spike.</span>
+            <span v-else-if="step1Done">Now toggle KEDA on and try again.</span>
+            <span v-else>Start with Step 1 — ring the bell without KEDA.</span>
+          </div>
+        </div>
+
+        <div class="main-layout">
+          <div class="main-content">
+            <div class="stat-cards">
+              <div class="glass">
+                <div class="card-label">Replicas</div>
+                <div class="card-value v-accent">{{ deployment.ready }}</div>
+                <div class="card-sub">desired: {{ deployment.desired }}</div>
+                <div class="card-label" style="margin-top:1rem">ScaledObject</div>
+                <div :class="['so-status', scaledObjectExists ? 'active' : 'missing']">
+                  <span class="so-dot"></span>
+                  {{ scaledObjectExists ? 'Created' : 'Not Found' }}
+                </div>
+              </div>
+              <div class="glass ticker-card">
+                <div class="card-label">Total Orders</div>
+                <div class="ticker">
+                  <div v-for="(d, i) in tickerDigits" :key="d.key"
+                       class="ticker-slot digit">
+                    <transition name="roll" mode="out-in">
+                      <span :key="d.ch" class="ticker-ch">{{ d.ch }}</span>
+                    </transition>
+                  </div>
+                </div>
+                <div class="card-sub">uptime: {{ uptimeStr }}</div>
+              </div>
+              <div class="glass gauge-wrap">
+                <div class="card-label">Fill Rate</div>
+                <div class="gauge" :style="{background: gaugeGradient}">
+                  <div class="gauge-inner">
+                    <div class="gauge-pct" :class="successRate >= 90 ? 'v-green' : successRate >= 50 ? 'v-amber' : 'v-red'">{{ successRate }}%</div>
+                    <div class="gauge-pct-label">filled</div>
+                  </div>
+                </div>
+                <div class="gauge-legend">
+                  <span><span class="gauge-legend-dot" style="background:var(--green)"></span>Filled</span>
+                  <span><span class="gauge-legend-dot" style="background:var(--red)"></span>Rejected</span>
+                </div>
+              </div>
+              <div class="glass keda-panel">
+                <div class="card-label">KEDA Cron</div>
+                <div :class="['keda-badge', scaledObjectExists ? 'on' : 'off']">
+                  <span class="keda-dot"></span>
+                  {{ scaledObjectExists ? 'Active' : 'Disabled' }}
+                </div>
+                <div :class="['toggle-wrap', scaledObjectExists ? 'on' : 'off']" @click="toggleKeda" style="margin-top:.5rem">
+                  <div class="toggle-track"><div class="toggle-thumb"></div></div>
+                  <span class="toggle-label">{{ scaledObjectExists ? 'On' : 'Off' }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="glass schedule-card">
+              <div class="schedule-info">
+                <div class="card-label" style="margin-bottom:.75rem">Cron Schedule (Production)</div>
+                <div class="schedule-row">
+                  <span class="schedule-label">Scale Up</span>
+                  <span class="schedule-value v-green">09:25 AM ET</span>
+                  <span class="schedule-label">Mon — Fri</span>
+                </div>
+                <div class="schedule-row">
+                  <span class="schedule-label">Scale Down</span>
+                  <span class="schedule-value v-amber">04:05 PM ET</span>
+                  <span class="schedule-label">Mon — Fri</span>
+                </div>
+                <div class="schedule-row">
+                  <span class="schedule-label">Target</span>
+                  <span class="schedule-value v-accent">10 replicas</span>
+                </div>
+                <div class="schedule-note">Demo toggle uses a live window so scaling activates immediately</div>
+              </div>
+              <div class="schedule-divider"></div>
+              <div class="schedule-status">
+                <div class="schedule-status-label">Window</div>
+                <div :class="['schedule-status-value', scaledObjectExists ? 'v-green' : 'v-red']">
+                  {{ scaledObjectExists ? 'ACTIVE' : 'INACTIVE' }}
+                </div>
+              </div>
+            </div>
+
+            <div class="glass surge-bar">
+              <div class="surge-bar-left">
+                <div class="surge-bar-label">Order Flow Simulator</div>
+                <div class="surge-bar-row">
+                  <span class="surge-bar-off">Off</span>
+                  <input type="range" min="0" max="50" step="1"
+                         :value="surgeThreads"
+                         @input="setSurgeThreads($event.target.value)"
+                         class="surge-slider"
+                         :style="{'--pct': (surgeThreads / 50 * 100) + '%'}">
+                  <span class="surge-bar-max">Max</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:1rem;margin-top:.3rem">
+                  <span class="surge-bar-value" :class="surgeThreads > 0 ? 'v-red' : 'v-dim'">{{ surgeThreads }} threads</span>
+                  <button :class="['btn-bell', surgeThreads >= 40 ? 'ringing' : '']"
+                          @click="ringTheBell">
+                    {{ surgeThreads >= 40 ? 'Stop' : 'Simulate 9:30' }}
+                  </button>
+                </div>
+              </div>
+              <div class="surge-rate">
+                <div :class="['surge-rate-value', rateExceeded ? 'v-red' : 'v-green']">{{ live.rate }}</div>
+                <div class="surge-rate-label">orders/s</div>
+              </div>
+            </div>
+
+            <div class="glass section">
+              <div class="section-title">
+                Order Book
+                <button class="btn-flat" @click="resetStats">Reset Stats</button>
+              </div>
+              <div>
+                <div class="live-stats">
+                  <div class="live-stat">
+                    <div class="live-stat-value v-green">{{ stats.success.toLocaleString() }}</div>
+                    <div class="live-stat-label">Filled (200)</div>
+                  </div>
+                  <div class="live-stat">
+                    <div class="live-stat-value v-red">{{ stats.rejected.toLocaleString() }}</div>
+                    <div class="live-stat-label">Rejected (503)</div>
+                  </div>
+                  <div :class="['live-stat', rateStatus]">
+                    <div :class="['live-stat-value', rateExceeded ? 'v-red' : 'v-green']">{{ live.rate }}</div>
+                    <div class="live-stat-label">Orders/sec</div>
+                  </div>
+                </div>
+                <div class="error-bar-wrap">
+                  <div class="error-bar-label">
+                    <span>Rejection Rate</span>
+                    <span>{{ errorPct }}%</span>
+                  </div>
+                  <div class="error-bar-bg">
+                    <div :class="['error-bar-fill', errorLevel]"
+                         :style="{width: errorPct + '%'}"></div>
+                  </div>
+                </div>
+                <div class="chart-wrap">
+                  <canvas ref="chartCanvas"></canvas>
+                </div>
+              </div>
+            </div>
+
+            <div class="glass section">
+              <div class="section-title">Timeline</div>
+              <div class="timeline-box" ref="timeline">
+                <div v-for="(ev, i) in events" :key="i" :class="['ev', ev.cls]">
+                  <span class="t">{{ ev.time }}</span>
+                  <span class="m">{{ ev.msg }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="glass pods-sidebar">
+            <div class="section-title">
+              Pods <span class="badge">{{ pods.length }}</span>
+            </div>
+            <div class="pods-grid">
+              <div v-for="p in pods" :key="p.name"
+                   :class="['pod-card', 'pod-enter', {me: p.is_me}]">
+                <div class="pod-header">
+                  <span class="pod-name">
+                    {{ p.name }}<span v-if="p.is_me" class="pod-me">YOU</span>
+                  </span>
+                  <span :class="['pod-phase', p.phase.toLowerCase().replace(/\s/g,'')]">
+                    {{ p.phase }}
+                  </span>
+                </div>
+                <div class="pod-info">
+                  <span>
+                    <span :class="['pod-dot-indicator', p.ready ? 'up' : 'down']"></span>
+                    {{ p.ready ? 'Ready' : 'Not Ready' }}
+                  </span>
+                  <span>Age: {{ timeSince(p.created) }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+    const { createApp, ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
+
+    createApp({
+      setup() {
+        const stats = reactive({ total: 0, success: 0, rejected: 0, uptime_seconds: 0 });
+        const deployment = reactive({ ready: 1, desired: 1 });
+        const pods = ref([]);
+        const scaledObjectExists = ref(false);
+        const surgeThreads = ref(0);
+        const live = reactive({ ok: 0, err: 0, rate: '0' });
+        const events = reactive([]);
+        const knownPods = new Set();
+        const chartCanvas = ref(null);
+        const timeline = ref(null);
+        let chart = null;
+        let intervals = [];
+
+        const step1Done = ref(false);
+        const step1Rej = ref(0);
+        const step1Total = ref(0);
+        const step2Done = ref(false);
+        const step2Rej = ref(0);
+        const step2Total = ref(0);
+
+        const rateExceeded = computed(() => parseFloat(live.rate) > 5);
+        const rateStatus = computed(() => {
+          const r = parseFloat(live.rate);
+          if (r === 0) return '';
+          return r > 5 ? 'rate-exceeded' : 'rate-ok';
+        });
+
+        const uptimeStr = computed(() => {
+          const m = Math.floor(stats.uptime_seconds / 60);
+          const s = Math.floor(stats.uptime_seconds % 60);
+          return m + 'm ' + s + 's';
+        });
+
+        const errorPct = computed(() => {
+          const t = live.ok + live.err;
+          return t > 0 ? Math.round(live.err / t * 100) : 0;
+        });
+
+        const errorLevel = computed(() =>
+          errorPct.value < 10 ? 'low' : errorPct.value < 40 ? 'med' : 'high'
+        );
+
+        let smoothSuccess = 100;
+        const successRate = ref(100);
+
+        const gaugeGradient = computed(() => {
+          const s = successRate.value;
+          const successDeg = Math.round(s * 3.6);
+          return `conic-gradient(var(--green) 0deg, var(--green) ${successDeg}deg, var(--red) ${successDeg}deg, var(--red) 360deg)`;
+        });
+
+        const tickerDigits = computed(() => {
+          const s = String(stats.total);
+          const padded = s.padStart(4, '0');
+          return padded.split('').map((ch, i) => ({ ch, key: i }));
+        });
+
+        const etTime = ref('');
+        const marketPhase = ref('closed');
+        const marketStatusText = ref('Closed');
+        const bellCountdown = ref('');
+
+        function updateClock() {
+          const now = new Date();
+          etTime.value = now.toLocaleTimeString('en-US', {
+            timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+          });
+          const etStr = now.toLocaleString('en-US', { timeZone: 'America/New_York' });
+          const et = new Date(etStr);
+          const day = et.getDay();
+          const mins = et.getHours() * 60 + et.getMinutes();
+          if (day === 0 || day === 6) {
+            marketPhase.value = 'closed';
+            marketStatusText.value = 'Weekend';
+            bellCountdown.value = '';
+          } else if (mins < 570) {
+            marketPhase.value = 'pre';
+            marketStatusText.value = 'Pre-Market';
+            const diff = 570 - mins;
+            const h = Math.floor(diff / 60);
+            const m = diff % 60;
+            bellCountdown.value = (h > 0 ? h + 'h ' : '') + m + 'm to bell';
+          } else if (mins < 960) {
+            marketPhase.value = 'open';
+            marketStatusText.value = 'Market Open';
+            const diff = 960 - mins;
+            const h = Math.floor(diff / 60);
+            const m = diff % 60;
+            bellCountdown.value = (h > 0 ? h + 'h ' : '') + m + 'm to close';
+          } else {
+            marketPhase.value = 'after';
+            marketStatusText.value = 'After Hours';
+            bellCountdown.value = '';
+          }
+        }
+
+        function timeSince(iso) {
+          const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+          if (s < 60) return s + 's';
+          if (s < 3600) return Math.floor(s / 60) + 'm';
+          return Math.floor(s / 3600) + 'h';
+        }
+
+        function tlog(msg, cls) {
+          events.push({ time: new Date().toLocaleTimeString(), msg, cls: cls || '' });
+          if (events.length > 100) events.splice(0, events.length - 80);
+          nextTick(() => { if (timeline.value) timeline.value.scrollTop = timeline.value.scrollHeight; });
+        }
+
+        let prevLive = null;
+        let prevLiveTime = 0;
+        let smoothRate = 0;
+        async function fetchStats() {
+          try {
+            const d = await (await fetch('/stats')).json();
+            Object.assign(stats, d);
+            const now = Date.now();
+            if (prevLive) {
+              const dt = (now - prevLiveTime) / 1000 || 1;
+              const dOk = Math.max(0, d.success - prevLive.success);
+              const dErr = Math.max(0, d.rejected - prevLive.rejected);
+              live.ok = dOk;
+              live.err = dErr;
+              const instantRate = (dOk + dErr) / dt;
+              smoothRate = smoothRate === 0 ? instantRate : 0.2 * instantRate + 0.8 * smoothRate;
+              live.rate = smoothRate.toFixed(1);
+              const instantSuccess = (dOk + dErr) > 0 ? Math.round(dOk / (dOk + dErr) * 100) : smoothSuccess;
+              smoothSuccess = 0.3 * instantSuccess + 0.7 * smoothSuccess;
+              successRate.value = Math.round(smoothSuccess);
+            }
+            prevLive = { success: d.success, rejected: d.rejected };
+            prevLiveTime = now;
+          } catch(e) {}
+        }
+
+        async function fetchPods() {
+          try {
+            const d = await (await fetch('/pods')).json();
+            deployment.ready = d.deployment.ready || 0;
+            deployment.desired = d.deployment.desired;
+            const current = new Set(d.pods.map(p => p.name));
+            for (const name of knownPods) {
+              if (!current.has(name)) {
+                knownPods.delete(name);
+                tlog('Pod removed: ' + name.split('-').pop(), 'removed');
+              }
+            }
+            d.pods.forEach(p => {
+              if (!knownPods.has(p.name)) {
+                tlog('Pod added: ' + p.name.split('-').pop() + ' (' + p.phase + ')', 'added');
+                knownPods.add(p.name);
+              }
+            });
+            pods.value = d.pods;
+          } catch(e) {}
+        }
+
+        async function fetchKeda() {
+          try {
+            const d = await (await fetch('/keda-status')).json();
+            scaledObjectExists.value = d.exists;
+          } catch(e) {}
+        }
+
+        async function toggleKeda() {
+          const action = scaledObjectExists.value ? 'disable' : 'enable';
+          scaledObjectExists.value = !scaledObjectExists.value;
+          if (action === 'enable' && step1Done.value && !step2Done.value) {
+            resetStats();
+            tlog('Stats auto-reset for Step 2', 'info');
+          }
+          tlog(action === 'enable'
+            ? 'Cron ScaledObject CREATED — pre-scaling active'
+            : 'Cron ScaledObject DELETED — pre-scaling disabled', 'info');
+          try {
+            await fetch('/keda-toggle?action=' + action, {method: 'POST'});
+          } catch(e) {
+            scaledObjectExists.value = !scaledObjectExists.value;
+            tlog('Failed to toggle KEDA', 'warn');
+          }
+          fetchKeda();
+        }
+
+        async function resetStats() {
+          await fetch('/reset-stats', {method: 'POST'});
+          live.ok = 0; live.err = 0; live.rate = '0';
+          tlog('Stats reset', 'info');
+          fetchStats();
+        }
+
+        function resetDemo() {
+          step1Done.value = false; step1Rej.value = 0; step1Total.value = 0;
+          step2Done.value = false; step2Rej.value = 0; step2Total.value = 0;
+          if (scaledObjectExists.value) toggleKeda();
+          resetStats();
+          tlog('Demo reset — start from Step 1', 'info');
+        }
+
+        function ringTheBell() {
+          if (surgeThreads.value >= 40) {
+            setSurgeThreads(0);
+            if (!scaledObjectExists.value && !step1Done.value) {
+              step1Done.value = true;
+              step1Rej.value = stats.rejected;
+              step1Total.value = stats.total;
+              tlog('Step 1 complete — ' + stats.rejected + ' orders rejected', 'warn');
+            } else if (scaledObjectExists.value && step1Done.value && !step2Done.value) {
+              step2Done.value = true;
+              step2Rej.value = stats.rejected;
+              step2Total.value = stats.total;
+              tlog('Step 2 complete — ' + stats.rejected + ' orders rejected', 'info');
+            }
+          } else {
+            setSurgeThreads(45);
+            tlog('9:30 AM — Market opens! Orders flooding in...', 'bell');
+          }
+        }
+
+        let surgePoll = null;
+        let surgeDebounce = null;
+
+        function setSurgeThreads(val) {
+          const n = parseInt(val) || 0;
+          surgeThreads.value = n;
+          clearTimeout(surgeDebounce);
+          surgeDebounce = setTimeout(() => {
+            fetch('/surge-set?threads=' + n, {method: 'POST'});
+            if (n > 0 && !surgePoll) {
+              surgePoll = setInterval(fetchStats, 2000);
+              tlog('Order flow set to ' + n + ' threads', 'warn');
+            } else if (n === 0 && surgePoll) {
+              clearInterval(surgePoll); surgePoll = null;
+              tlog('Order flow stopped', 'info');
+            } else if (n > 0) {
+              tlog('Order flow adjusted to ' + n + ' threads', 'info');
+            }
+          }, 100);
+        }
+
+        function initChart() {
+          if (!chartCanvas.value) return;
+          const ctx = chartCanvas.value.getContext('2d');
+          chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: [],
+              datasets: [
+                {
+                  label: 'Filled/s', data: [], borderColor: '#34d399',
+                  backgroundColor: 'rgba(52,211,153,.08)', fill: true,
+                  tension: .4, pointRadius: 0, borderWidth: 2,
+                },
+                {
+                  label: 'Rejected/s', data: [], borderColor: '#fb7185',
+                  backgroundColor: 'rgba(251,113,133,.08)', fill: true,
+                  tension: .4, pointRadius: 0, borderWidth: 2,
+                },
+                {
+                  label: 'Pods', data: [], borderColor: '#818cf8',
+                  backgroundColor: 'rgba(129,140,248,.08)', fill: true,
+                  tension: .4, pointRadius: 0, borderWidth: 2, yAxisID: 'y1',
+                },
+              ],
+            },
+            options: {
+              responsive: true, maintainAspectRatio: false,
+              animation: { duration: 300 },
+              interaction: { mode: 'index', intersect: false },
+              plugins: {
+                legend: {
+                  labels: { color: 'rgba(255,255,255,.45)', font: { family: 'Red Hat Display', size: 10 }, boxWidth: 12, padding: 12 },
+                },
+              },
+              scales: {
+                x: { display: false },
+                y: {
+                  position: 'left', beginAtZero: true,
+                  grid: { color: 'rgba(255,255,255,.04)' },
+                  ticks: { color: 'rgba(255,255,255,.3)', font: { size: 10 } },
+                  title: { display: true, text: 'orders/s', color: 'rgba(255,255,255,.3)', font: { size: 10 } },
+                },
+                y1: {
+                  position: 'right', beginAtZero: true,
+                  grid: { drawOnChartArea: false },
+                  ticks: { color: 'rgba(129,140,248,.5)', font: { size: 10 }, stepSize: 1 },
+                  title: { display: true, text: 'pods', color: 'rgba(129,140,248,.5)', font: { size: 10 } },
+                },
+              },
+            },
+          });
+        }
+
+        let prevStats = null;
+        function updateChart() {
+          if (!chart) return;
+          const now = new Date().toLocaleTimeString();
+          const okRate = prevStats ? Math.max(0, stats.success - prevStats.success) / 2 : 0;
+          const errRate = prevStats ? Math.max(0, stats.rejected - prevStats.rejected) / 2 : 0;
+          prevStats = { success: stats.success, rejected: stats.rejected };
+
+          chart.data.labels.push(now);
+          chart.data.datasets[0].data.push(okRate.toFixed(1));
+          chart.data.datasets[1].data.push(errRate.toFixed(1));
+          chart.data.datasets[2].data.push(deployment.ready);
+
+          const maxPts = 60;
+          if (chart.data.labels.length > maxPts) {
+            chart.data.labels.splice(0, chart.data.labels.length - maxPts);
+            chart.data.datasets.forEach(ds => ds.data.splice(0, ds.data.length - maxPts));
+          }
+          chart.update('none');
+        }
+
+        onMounted(() => {
+          updateClock();
+          fetchStats(); fetchPods(); fetchKeda();
+          initChart();
+          intervals.push(setInterval(updateClock, 1000));
+          intervals.push(setInterval(() => { fetchStats().then(updateChart); }, 2000));
+          intervals.push(setInterval(fetchPods, 2000));
+          intervals.push(setInterval(fetchKeda, 3000));
+        });
+
+        onUnmounted(() => {
+          intervals.forEach(clearInterval);
+          if (surgePoll) clearInterval(surgePoll);
+        });
+
+        return {
+          stats, deployment, pods, scaledObjectExists, surgeThreads,
+          live, events, uptimeStr, errorPct, errorLevel,
+          rateExceeded, rateStatus, successRate, gaugeGradient, tickerDigits,
+          etTime, marketPhase, marketStatusText, bellCountdown,
+          step1Done, step1Rej, step1Total, step2Done, step2Rej, step2Total,
+          chartCanvas, timeline,
+          timeSince, toggleKeda, resetStats, resetDemo, setSurgeThreads, ringTheBell,
+        };
+      },
+    }).mount('#app');
+    </script>
+    </body>
+    </html>'''
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/healthz':
+                self._ok(b'ok')
+                return
+
+            if self.path == '/metrics':
+                with stats['lock']:
+                    total = stats['total']
+                    success = stats['success']
+                    rejected = stats['rejected']
+                body = (
+                    '# HELP http_requests_total Total HTTP requests handled.\n'
+                    '# TYPE http_requests_total counter\n'
+                    f'http_requests_total{{app="trading-app",status="200"}} {success}\n'
+                    f'http_requests_total{{app="trading-app",status="503"}} {rejected}\n'
+                    '# HELP http_requests_in_flight Current concurrent requests.\n'
+                    '# TYPE http_requests_in_flight gauge\n'
+                    f'http_requests_in_flight{{app="trading-app"}} {concurrent["count"]}\n'
+                ).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain; version=0.0.4')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path == '/logo.png':
+                try:
+                    with open('/logo/rhlogo.png', 'rb') as f:
+                        data = f.read()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/png')
+                    self.send_header('Cache-Control', 'public, max-age=86400')
+                    self.end_headers()
+                    self.wfile.write(data)
+                except FileNotFoundError:
+                    self.send_response(404)
+                    self.end_headers()
+                return
+
+            if self.path == '/stats':
+                with stats['lock']:
+                    data = {
+                        'total': stats['total'],
+                        'success': stats['success'],
+                        'rejected': stats['rejected'],
+                        'total_ms': round(stats['total_ms'], 1),
+                        'uptime_seconds': round(time.time() - start_time, 1),
+                    }
+                self._json(data)
+                return
+
+            if self.path == '/pods':
+                try:
+                    self._json({'pods': get_pods(), 'deployment': get_deployment()})
+                except Exception as e:
+                    self._json({'error': str(e)}, 500)
+                return
+
+            if self.path == '/keda-status':
+                try:
+                    self._json(get_keda_status())
+                except Exception as e:
+                    self._json({'paused': True, 'exists': False, 'error': str(e)})
+                return
+
+            if self.path.startswith('/burn'):
+                reject = False
+                with concurrent['lock']:
+                    c = concurrent['count']
+                    if c >= MAX_CONCURRENT:
+                        reject = True
+                    elif c > SOFT_LIMIT:
+                        prob = min(MAX_REJECT_PROB, (c - SOFT_LIMIT) * 0.03)
+                        reject = random.random() < prob
+                    if not reject:
+                        concurrent['count'] += 1
+
+                if reject:
+                    with stats['lock']:
+                        stats['total'] += 1
+                        stats['rejected'] += 1
+                    self.send_response(503)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        'error': 'overloaded',
+                        'pod': hostname,
+                        'concurrent': c,
+                    }).encode())
+                    return
+
+                try:
+                    intensity = 'medium'
+                    if '?' in self.path:
+                        params = dict(p.split('=') for p in self.path.split('?')[1].split('&') if '=' in p)
+                        intensity = params.get('intensity', 'medium')
+
+                    duration = {'light': 0.2, 'medium': 0.5, 'heavy': 1.0}.get(intensity, 0.5)
+                    t0 = time.time()
+                    time.sleep(duration)
+                    elapsed_ms = (time.time() - t0) * 1000
+
+                    with stats['lock']:
+                        stats['total'] += 1
+                        stats['success'] += 1
+                        stats['total_ms'] += elapsed_ms
+
+                    self._json({'pod': hostname, 'compute_ms': round(elapsed_ms, 1)})
+                finally:
+                    with concurrent['lock']:
+                        concurrent['count'] -= 1
+                return
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML.encode())
+
+        def do_POST(self):
+            if self.path == '/reset-stats':
+                with stats['lock']:
+                    stats['total'] = 0
+                    stats['success'] = 0
+                    stats['rejected'] = 0
+                    stats['total_ms'] = 0
+                self._json({'ok': True})
+                return
+
+            if self.path.startswith('/surge-set'):
+                threads = 0
+                if '?' in self.path:
+                    params = dict(p.split('=') for p in self.path.split('?')[1].split('&') if '=' in p)
+                    threads = int(params.get('threads', '0'))
+                set_surge_threads(threads)
+                self._json({'ok': True, 'threads': surge_state['target']})
+                return
+
+            if self.path.startswith('/keda-toggle'):
+                action = 'enable'
+                if '?' in self.path:
+                    params = dict(p.split('=') for p in self.path.split('?')[1].split('&') if '=' in p)
+                    action = params.get('action', 'enable')
+                try:
+                    if action == 'enable':
+                        create_scaled_object()
+                    else:
+                        delete_scaled_object()
+                        k8s_request('PATCH',
+                            f'/apis/apps/v1/namespaces/{namespace}/deployments/trading-app',
+                            {'spec': {'replicas': 1}})
+                    self._json({'ok': True, 'action': action})
+                except Exception as e:
+                    self._json({'error': str(e)}, 500)
+                return
+
+        def _ok(self, body):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, data, code=200):
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadedHTTPServer(('', 8080), Handler)
+    print(f"Trading platform on :8080 (pod: {hostname}, max_concurrent: {MAX_CONCURRENT})")
+    server.serve_forever()

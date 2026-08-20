@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-producer
+  namespace: keda-demo
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: producer
+          image: python:3.11-slim
+          env:
+            - name: HOME
+              value: /tmp
+          command:
+            - bash
+            - -c
+            - |
+              pip install --quiet --user kafka-python && python3 -u <<'PYEOF'
+              from kafka import KafkaProducer
+              import json, time
+
+              producer = KafkaProducer(
+                  bootstrap_servers='lightwell-kafka-bootstrap.lightwell-infra.svc:9092',
+                  value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+              )
+
+              for i in range(100):
+                  order = {"order_id": i, "item": f"widget-{i}", "quantity": i % 10 + 1}
+                  producer.send('keda-demo-orders', value=order)
+                  if i % 25 == 0:
+                      print(f"Sent {i+1}/100 messages...")
+
+              producer.flush()
+              print("All 100 messages sent.")
+              PYEOF

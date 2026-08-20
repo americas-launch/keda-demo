@@ -1,0 +1,35 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: prom-app-scaler
+  namespace: keda-demo
+spec:
+  scaleTargetRef:
+    name: prom-app
+  pollingInterval: 15
+  cooldownPeriod: 60
+  minReplicaCount: 1
+  maxReplicaCount: 6
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        query: sum(rate(http_requests_total{namespace="keda-demo"}[1m]))
+        threshold: "10"
+        authModes: "bearer"
+      authenticationRef:
+        name: prom-trigger-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: prom-trigger-auth
+  namespace: keda-demo
+spec:
+  secretTargetRef:
+    - parameter: bearerToken
+      name: keda-prom-token
+      key: token
+    - parameter: ca
+      name: keda-prom-token
+      key: ca.crt

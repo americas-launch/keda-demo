@@ -1,0 +1,13 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prom-app-monitor
+  namespace: keda-demo
+spec:
+  selector:
+    matchLabels:
+      app: prom-app
+  endpoints:
+    - port: http
+      interval: 15s
+      path: /metrics

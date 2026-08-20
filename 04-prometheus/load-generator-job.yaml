@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prom-load-generator
+  namespace: keda-demo
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: curlimages/curl:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Generating traffic to prom-app:8080/work..."
+              for i in $(seq 1 3000); do
+                curl -s -o /dev/null http://prom-app.keda-demo.svc:8080/work
+                if [ $((i % 100)) -eq 0 ]; then
+                  echo "Sent $i requests..."
+                fi
+              done
+              echo "Load generation complete."

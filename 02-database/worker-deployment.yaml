@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-worker
+  namespace: keda-demo
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: db-worker
+  template:
+    metadata:
+      labels:
+        app: db-worker
+    spec:
+      containers:
+        - name: worker
+          image: python:3.11-slim
+          env:
+            - name: HOME
+              value: /tmp
+          command:
+            - bash
+            - -c
+            - |
+              pip install --quiet --user psycopg2-binary && python3 -u <<'PYEOF'
+              import psycopg2, os, time
+
+              conn = psycopg2.connect(os.environ['CONNECTION_STRING'])
+              hostname = os.environ.get('HOSTNAME', 'unknown')
+
+              while True:
+                  cur = conn.cursor()
+                  cur.execute("""
+                      UPDATE jobs SET status = 'processing', processed_at = NOW()
+                      WHERE id = (
+                          SELECT id FROM jobs WHERE status = 'pending'
+                          ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
+                      )
+                      RETURNING id, payload
+                  """)
+                  row = cur.fetchone()
+                  conn.commit()
+
+                  if row is None:
+                      print(f"[{hostname}] No pending rows, sleeping...")
+                      time.sleep(10)
+                      continue
+
+                  job_id, payload = row
+                  print(f"[{hostname}] Processing job {job_id}: {payload}")
+                  time.sleep(3)
+
+                  cur.execute("UPDATE jobs SET status = 'done' WHERE id = %s", (job_id,))
+                  conn.commit()
+                  print(f"[{hostname}] Completed job {job_id}")
+                  cur.close()
+              PYEOF
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi

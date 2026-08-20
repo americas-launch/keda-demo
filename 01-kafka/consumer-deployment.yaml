@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-consumer
+  namespace: keda-demo
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: kafka-consumer
+  template:
+    metadata:
+      labels:
+        app: kafka-consumer
+    spec:
+      containers:
+        - name: consumer
+          image: python:3.11-slim
+          env:
+            - name: HOME
+              value: /tmp
+          command:
+            - bash
+            - -c
+            - |
+              pip install --quiet --user kafka-python && python3 -u <<'PYEOF'
+              from kafka import KafkaConsumer
+              import os, time
+
+              consumer = KafkaConsumer(
+                  'keda-demo-orders',
+                  bootstrap_servers='lightwell-kafka-bootstrap.lightwell-infra.svc:9092',
+                  group_id='keda-demo-consumer-group',
+                  auto_offset_reset='earliest',
+                  enable_auto_commit=True,
+                  consumer_timeout_ms=30000,
+              )
+
+              print("Consumer started, waiting for messages...")
+              for message in consumer:
+                  print(f"Processed: partition={message.partition} offset={message.offset} value={message.value[:50]}")
+                  time.sleep(0.1)
+
+              print("No more messages, consumer idle.")
+              time.sleep(300)
+              PYEOF
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi

@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trading-app
+  namespace: keda-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trading-app
+  template:
+    metadata:
+      labels:
+        app: trading-app
+    spec:
+      serviceAccountName: trading-app-sa
+      containers:
+        - name: app
+          image: python:3.11-slim
+          command: ["python3", "-u", "/app/server.py"]
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+            - name: logo
+              mountPath: /logo
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: app-code
+          configMap:
+            name: trading-app-code
+        - name: logo
+          configMap:
+            name: trading-app-logo

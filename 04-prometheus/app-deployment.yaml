@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prom-app
+  namespace: keda-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prom-app
+  template:
+    metadata:
+      labels:
+        app: prom-app
+    spec:
+      containers:
+        - name: app
+          image: python:3.11-slim
+          env:
+            - name: HOME
+              value: /tmp
+          command:
+            - bash
+            - -c
+            - |
+              pip install --quiet --user flask prometheus-client && python3 -u <<'PYEOF'
+              from flask import Flask
+              from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+
+              app = Flask(__name__)
+              REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint'])
+
+              @app.route('/work')
+              def work():
+                  REQUEST_COUNT.labels(method='GET', endpoint='/work').inc()
+                  return 'work done\n'
+
+              @app.route('/metrics')
+              def metrics():
+                  return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+
+              @app.route('/healthz')
+              def healthz():
+                  return 'ok'
+
+              app.run(host='0.0.0.0', port=8080)
+              PYEOF
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi

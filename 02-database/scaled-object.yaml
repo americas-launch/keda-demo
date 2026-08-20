@@ -1,0 +1,32 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: db-worker-scaler
+  namespace: keda-demo
+spec:
+  scaleTargetRef:
+    name: db-worker
+  pollingInterval: 10
+  cooldownPeriod: 15
+  minReplicaCount: 1
+  maxReplicaCount: 15
+  triggers:
+    - type: postgresql
+      metadata:
+        connectionFromEnv: CONNECTION_STRING
+        query: "SELECT COUNT(*) FROM jobs WHERE status = 'pending'"
+        targetQueryValue: "5"
+        activationTargetQueryValue: "1"
+      authenticationRef:
+        name: db-trigger-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: db-trigger-auth
+  namespace: keda-demo
+spec:
+  secretTargetRef:
+    - parameter: connection
+      name: postgres-credentials
+      key: CONNECTION_STRING

@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-seed
+  namespace: keda-demo
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: python:3.11-slim
+          env:
+            - name: HOME
+              value: /tmp
+          command:
+            - bash
+            - -c
+            - |
+              pip install --quiet --user psycopg2-binary && python3 -u <<'PYEOF'
+              import psycopg2, os
+
+              conn = psycopg2.connect(os.environ['CONNECTION_STRING'])
+              cur = conn.cursor()
+
+              for i in range(50):
+                  cur.execute(
+                      "INSERT INTO jobs (payload, status) VALUES (%s, 'pending')",
+                      (f'task-{i}: process data batch {i}',)
+                  )
+
+              conn.commit()
+              cur.close()
+              conn.close()
+              print("Inserted 50 pending rows.")
+              PYEOF
+          envFrom:
+            - secretRef:
+                name: postgres-credentials

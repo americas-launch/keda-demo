@@ -1,0 +1,19 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: trading-app-scaler
+  namespace: keda-demo
+spec:
+  scaleTargetRef:
+    name: trading-app
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: cron
+      metadata:
+        timezone: America/New_York
+        start: 25 9 * * 1-5
+        end: 5 16 * * 1-5
+        desiredReplicas: "10"

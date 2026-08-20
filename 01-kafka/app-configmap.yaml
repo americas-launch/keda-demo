@@ -1,0 +1,1194 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-app-code
+  namespace: keda-demo
+data:
+  server.py: |
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from socketserver import ThreadingMixIn
+    import json, os, ssl, threading, time, urllib.request
+
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    hostname = os.environ.get('HOSTNAME', 'unknown')
+    namespace = 'keda-demo'
+    start_time = time.time()
+
+    KAFKA_BOOTSTRAP = os.environ.get('KAFKA_BOOTSTRAP', 'lightwell-kafka-bootstrap.lightwell-infra.svc:9092')
+    KAFKA_TOPIC = os.environ.get('KAFKA_TOPIC', 'keda-demo-orders')
+    KAFKA_GROUP = os.environ.get('KAFKA_GROUP', 'keda-demo-consumer-group')
+
+    produce_stats = {'total_produced': 0, 'lock': threading.Lock()}
+    run_timer = {
+        'lock': threading.Lock(),
+        'produce_time': None,
+        'processing_start': None,
+        'run_end': None,
+        'run_messages': 0,
+        'initial_lag': 0,
+        'peak_consumers': 0,
+        'history': [],
+    }
+
+    from kafka import KafkaProducer, KafkaConsumer, TopicPartition, OffsetAndMetadata
+    from kafka.admin import KafkaAdminClient
+
+    def get_consumer_lag():
+        try:
+            consumer = KafkaConsumer(
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                group_id=KAFKA_GROUP,
+                enable_auto_commit=False,
+            )
+            partitions = consumer.partitions_for_topic(KAFKA_TOPIC)
+            if not partitions:
+                consumer.close()
+                return {'partitions': [], 'total_lag': 0, 'total_messages': 0}
+
+            tps = [TopicPartition(KAFKA_TOPIC, p) for p in sorted(partitions)]
+            end_offsets = consumer.end_offsets(tps)
+
+            committed = {}
+            for tp in tps:
+                c = consumer.committed(tp)
+                committed[tp] = c if c is not None else 0
+
+            consumer.close()
+
+            partition_data = []
+            total_lag = 0
+            total_messages = 0
+            for tp in tps:
+                end = end_offsets.get(tp, 0)
+                cur = committed.get(tp, 0)
+                lag = max(0, end - cur)
+                partition_data.append({
+                    'partition': tp.partition,
+                    'end_offset': end,
+                    'committed_offset': cur,
+                    'lag': lag,
+                })
+                total_lag += lag
+                total_messages += end
+
+            return {
+                'partitions': partition_data,
+                'total_lag': total_lag,
+                'total_messages': total_messages,
+            }
+        except Exception as e:
+            return {'partitions': [], 'total_lag': 0, 'total_messages': 0, 'error': str(e)}
+
+    produce_state = {'producing': False, 'sent': 0, 'target': 0, 'lock': threading.Lock()}
+
+    def _produce_worker(count):
+        try:
+            producer = KafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+            )
+            for i in range(count):
+                order = {"order_id": i, "item": f"widget-{i}", "quantity": i % 10 + 1, "ts": time.time()}
+                producer.send(KAFKA_TOPIC, value=order)
+                if (i + 1) % 50 == 0:
+                    producer.flush()
+            producer.flush()
+            producer.close()
+        except Exception:
+            pass
+        finally:
+            with produce_state['lock']:
+                produce_state['producing'] = False
+
+    def produce_messages(count):
+        with produce_stats['lock']:
+            produce_stats['total_produced'] += count
+        with produce_state['lock']:
+            produce_state['producing'] = True
+            produce_state['sent'] = 0
+            produce_state['target'] = count
+        with run_timer['lock']:
+            if run_timer['produce_time'] is None or run_timer['run_end'] is not None:
+                run_timer['produce_time'] = time.time()
+                run_timer['processing_start'] = None
+                run_timer['run_end'] = None
+                run_timer['run_messages'] = count
+                run_timer['peak_consumers'] = 0
+            else:
+                run_timer['run_messages'] += count
+        threading.Thread(target=_produce_worker, args=(count,), daemon=True).start()
+        return {'ok': True, 'produced': count}
+
+    K8S_HOST = 'https://kubernetes.default.svc'
+    TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+    CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+
+    def k8s_get(path):
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        ctx = ssl.create_default_context(cafile=CA_PATH)
+        req = urllib.request.Request(
+            f'{K8S_HOST}{path}',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def k8s_request(method, path, body=None):
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        ctx = ssl.create_default_context(cafile=CA_PATH)
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(
+            f'{K8S_HOST}{path}',
+            data=data,
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/merge-patch+json',
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def get_pods():
+        data = k8s_get(f'/api/v1/namespaces/{namespace}/pods?labelSelector=app%3Dkafka-consumer')
+        pods = []
+        for item in data.get('items', []):
+            meta = item['metadata']
+            status = item['status']
+            phase = status.get('phase', 'Unknown')
+            if meta.get('deletionTimestamp'):
+                phase = 'Terminating'
+            cs = status.get('containerStatuses', [])
+            ready = cs[0].get('ready', False) if cs else False
+            restarts = cs[0].get('restartCount', 0) if cs else 0
+            pods.append({
+                'name': meta['name'],
+                'phase': phase,
+                'ready': ready,
+                'restarts': restarts,
+                'created': meta.get('creationTimestamp', ''),
+            })
+        pods.sort(key=lambda p: p['created'])
+        return pods
+
+    def get_deployment():
+        data = k8s_get(f'/apis/apps/v1/namespaces/{namespace}/deployments/kafka-consumer')
+        s = data.get('status', {})
+        return {
+            'desired': data.get('spec', {}).get('replicas', 0),
+            'ready': s.get('readyReplicas', 0),
+            'available': s.get('availableReplicas', 0),
+        }
+
+    def get_keda_status():
+        try:
+            data = k8s_get(f'/apis/keda.sh/v1alpha1/namespaces/{namespace}/scaledobjects/kafka-consumer-scaler')
+            annotations = data.get('metadata', {}).get('annotations', {})
+            paused = annotations.get('autoscaling.keda.sh/paused', 'false') == 'true'
+            return {'paused': paused}
+        except Exception:
+            return {'paused': True}
+
+    def set_keda_paused(paused):
+        val = 'true' if paused else 'false'
+        k8s_request('PATCH',
+            f'/apis/keda.sh/v1alpha1/namespaces/{namespace}/scaledobjects/kafka-consumer-scaler',
+            {'metadata': {'annotations': {'autoscaling.keda.sh/paused': val}}}
+        )
+
+    HTML = r'''<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>KEDA Kafka Scaling Demo</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@400;500;600;700;800;900&family=Red+Hat+Mono:wght@400;500;600;700&display=swap');
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #06080f; --surface: rgba(255,255,255,.04); --surface-2: rgba(255,255,255,.07);
+      --border: rgba(255,255,255,.08); --border-hover: rgba(255,255,255,.15);
+      --text: #eef0f6; --text-dim: rgba(255,255,255,.45);
+      --accent: #818cf8; --accent-soft: rgba(129,140,248,.12);
+      --green: #34d399; --green-soft: rgba(52,211,153,.12);
+      --amber: #fbbf24; --amber-soft: rgba(251,191,36,.12);
+      --red: #fb7185; --red-soft: rgba(251,113,133,.12);
+      --cyan: #22d3ee; --cyan-soft: rgba(34,211,238,.12);
+      --radius: 16px; --radius-sm: 10px;
+    }
+    body {
+      font-family: 'Red Hat Display', -apple-system, system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(129,140,248,.08), transparent),
+        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(34,211,238,.06), transparent);
+    }
+    .app { max-width: 85%; margin: 0 auto; padding: 2rem 2.5rem 3rem; }
+    .main-layout { display: grid; grid-template-columns: 1fr 260px; gap: 1.25rem; align-items: start; }
+    .main-content { min-width: 0; }
+    .pods-sidebar {
+      position: sticky; top: 1.5rem;
+      max-height: calc(100vh - 3rem); overflow-y: auto;
+      scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.1) transparent;
+    }
+    .pods-sidebar::-webkit-scrollbar { width: 4px; }
+    .pods-sidebar::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 4px; }
+    .pods-sidebar .section-title { font-size: .8rem; }
+
+    header { text-align: center; margin-bottom: 2.5rem; }
+    header img { height: 44px; margin-bottom: 1rem; filter: drop-shadow(0 0 20px rgba(255,255,255,.08)); }
+    header h1 { font-size: 2rem; font-weight: 800; letter-spacing: -0.03em; margin-bottom: .35rem; }
+    header h1 em { font-style: normal; background: linear-gradient(135deg, var(--accent), var(--cyan)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    header p { color: var(--text-dim); font-size: .9rem; font-weight: 400; }
+
+    .glass {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 1.25rem;
+      backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+      transition: border-color .2s;
+    }
+    .glass:hover { border-color: var(--border-hover); }
+
+    .grid-top { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.25rem; }
+    .stat-cards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .75rem; }
+
+    .gauge-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .5rem; }
+    .gauge {
+      position: relative; width: 150px; height: 150px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      transition: background .6s ease;
+    }
+    .gauge-inner {
+      width: 120px; height: 120px; border-radius: 50%;
+      background: var(--bg); display: flex; flex-direction: column;
+      align-items: center; justify-content: center; position: relative; z-index: 1;
+    }
+    .gauge-pct {
+      font-family: 'Red Hat Mono', monospace; font-size: 2rem; font-weight: 700;
+      line-height: 1;
+    }
+    .gauge-pct-label { font-size: .55rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .08em; margin-top: .2rem; }
+    .gauge-legend {
+      display: flex; gap: 1.25rem; font-size: .85rem; color: var(--text-dim); font-weight: 500;
+    }
+    .gauge-legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: .3rem; vertical-align: middle; }
+
+    .card-label {
+      font-size: .6rem; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--text-dim); margin-bottom: .5rem; font-weight: 600;
+    }
+    .card-value {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.8rem; font-weight: 700; line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .card-sub { font-size: .7rem; color: var(--text-dim); margin-top: .3rem; }
+    .ticker-card { overflow: hidden; }
+    .ticker {
+      display: flex; justify-content: center; gap: 0;
+      font-family: 'Red Hat Mono', monospace; font-size: 1.8rem; font-weight: 700;
+      line-height: 1; font-variant-numeric: tabular-nums;
+    }
+    .ticker-slot {
+      position: relative; overflow: hidden;
+      width: 1.15em; height: 1.3em;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .ticker-slot.digit {
+      background: rgba(255,255,255,.04); border-radius: 4px;
+      margin: 0 1px; border: 1px solid rgba(255,255,255,.08);
+      box-shadow: inset 0 1px 2px rgba(0,0,0,.3);
+    }
+    .ticker-ch { display: block; }
+    .roll-enter-active, .roll-leave-active { transition: all .3s ease; }
+    .roll-enter-from { transform: translateY(100%); opacity: 0; }
+    .roll-leave-to { transform: translateY(-100%); opacity: 0; }
+    .v-green { color: var(--green); }
+    .v-red { color: var(--red); }
+    .v-amber { color: var(--amber); }
+    .v-accent { color: var(--accent); }
+    .v-cyan { color: var(--cyan); }
+
+    .keda-panel { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .6rem; text-align: center; }
+    .keda-label { font-size: .55rem; text-transform: uppercase; letter-spacing: .12em; color: var(--text-dim); font-weight: 600; }
+    .keda-badge {
+      display: inline-flex; align-items: center; gap: .5rem;
+      font-size: .8rem; font-weight: 600;
+      padding: .35rem .9rem; border-radius: 20px;
+    }
+    .keda-badge.off { background: var(--red-soft); color: var(--red); }
+    .keda-badge.on { background: var(--green-soft); color: var(--green); }
+    .keda-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .keda-badge.off .keda-dot { background: var(--red); }
+    .keda-badge.on .keda-dot { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse-glow 2s infinite; }
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 4px var(--green); }
+      50% { box-shadow: 0 0 14px var(--green); }
+    }
+    .keda-desc { font-size: .72rem; color: var(--text-dim); line-height: 1.6; max-width: 300px; }
+    .keda-desc code {
+      font-family: 'Red Hat Mono', monospace; font-size: .62rem;
+      background: var(--surface-2); padding: .1rem .35rem; border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+
+    .toggle-wrap { display: flex; align-items: center; gap: .75rem; cursor: pointer; }
+    .toggle-label {
+      font-family: 'Red Hat Display', sans-serif; font-size: .75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim);
+      transition: color .3s;
+    }
+    .toggle-wrap.on .toggle-label { color: var(--green); }
+    .toggle-wrap.off .toggle-label { color: var(--red); }
+    .toggle-track {
+      width: 56px; height: 30px; border-radius: 15px;
+      position: relative; transition: background .3s, box-shadow .3s;
+      flex-shrink: 0;
+    }
+    .toggle-wrap.off .toggle-track {
+      background: linear-gradient(135deg, #ef4444, var(--red));
+      box-shadow: 0 2px 12px rgba(251,113,133,.25);
+    }
+    .toggle-wrap.on .toggle-track {
+      background: linear-gradient(135deg, #10b981, var(--green));
+      box-shadow: 0 2px 12px rgba(52,211,153,.3);
+    }
+    .toggle-thumb {
+      width: 24px; height: 24px; border-radius: 50%;
+      background: #fff; position: absolute; top: 3px;
+      transition: left .3s cubic-bezier(.4,0,.2,1);
+      box-shadow: 0 1px 4px rgba(0,0,0,.3);
+    }
+    .toggle-wrap.off .toggle-thumb { left: 3px; }
+    .toggle-wrap.on .toggle-thumb { left: 29px; }
+
+    .controls-row {
+      display: flex; gap: 1.5rem; align-items: flex-start;
+      padding-top: .4rem;
+    }
+    .control-group { display: flex; flex-direction: column; align-items: center; gap: .35rem; }
+    .control-group-label { font-size: .55rem; text-transform: uppercase; letter-spacing: .12em; color: var(--text-dim); font-weight: 600; }
+
+    .produce-controls {
+      display: flex; flex-direction: column; align-items: center; gap: .4rem;
+      padding-top: .5rem; border-top: 1px solid var(--border); width: 100%;
+    }
+    .produce-buttons { display: flex; gap: .35rem; }
+    .btn-produce {
+      border: none; border-radius: 8px; padding: .45rem .85rem;
+      font-family: 'Red Hat Mono', monospace; font-size: .75rem; font-weight: 700;
+      cursor: pointer;
+      background: linear-gradient(135deg, #22d3ee, #06b6d4);
+      color: #1a1a2e; transition: all .2s;
+    }
+    .btn-produce:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(34,211,238,.3); }
+    .btn-produce:active { transform: scale(.95); }
+    .btn-produce:disabled { opacity: .4; cursor: not-allowed; transform: none; box-shadow: none; }
+    .btn-clear {
+      border: 1px solid var(--border); border-radius: 6px; padding: .25rem .7rem;
+      font-family: 'Red Hat Display', sans-serif; font-size: .6rem; font-weight: 600;
+      cursor: pointer; background: var(--surface-2); color: var(--text-dim);
+      text-transform: uppercase; letter-spacing: .04em; transition: all .15s;
+    }
+    .btn-clear:hover { border-color: var(--red); color: var(--red); }
+
+    .section { margin-bottom: 1.25rem; }
+    .section-title {
+      font-size: .85rem; font-weight: 700; margin-bottom: .75rem;
+      display: flex; align-items: center; gap: .5rem;
+    }
+    .badge {
+      font-family: 'Red Hat Mono', monospace; background: var(--surface-2);
+      border: 1px solid var(--border); padding: .15rem .5rem; border-radius: 8px;
+      font-size: .65rem; color: var(--text-dim); font-weight: 500;
+    }
+
+    .live-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem; }
+    .live-stat {
+      background: var(--surface); border-radius: var(--radius-sm); padding: .85rem;
+      text-align: center; border: 1px solid var(--border); transition: all .4s ease;
+    }
+    .live-stat-value {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.5rem; font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .live-stat-label { font-size: .55rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin-top: .25rem; font-weight: 600; }
+    .threshold-label { font-size: .6rem; color: var(--text-dim); margin-top: .3rem; font-weight: 500; }
+    .threshold-label span { font-family: 'Red Hat Mono', monospace; font-weight: 700; }
+    .live-stat.lag-alert {
+      border-color: rgba(251,191,36,.5); background: rgba(251,191,36,.08);
+      animation: lag-pulse 1.5s ease infinite;
+    }
+    @keyframes lag-pulse {
+      0%, 100% { box-shadow: 0 0 15px rgba(251,191,36,.08); }
+      50% { box-shadow: 0 0 30px rgba(251,191,36,.2); }
+    }
+
+    .partitions-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5rem; margin-top: .75rem; }
+    .partition-card {
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: .7rem; text-align: center;
+      transition: all .3s ease;
+    }
+    .partition-card.has-lag {
+      border-color: rgba(251,191,36,.4); background: rgba(251,191,36,.05);
+    }
+    .partition-id {
+      font-family: 'Red Hat Mono', monospace; font-size: .6rem;
+      color: var(--text-dim); text-transform: uppercase; letter-spacing: .08em;
+      font-weight: 600; margin-bottom: .3rem;
+    }
+    .partition-lag {
+      font-family: 'Red Hat Mono', monospace; font-size: 1.2rem; font-weight: 700;
+    }
+    .partition-offsets {
+      font-family: 'Red Hat Mono', monospace; font-size: .55rem;
+      color: var(--text-dim); margin-top: .2rem;
+    }
+
+    .lag-bar-wrap { margin-top: .75rem; }
+    .lag-bar-label {
+      font-size: .65rem; color: var(--text-dim); margin-bottom: .35rem;
+      display: flex; justify-content: space-between; font-weight: 500;
+    }
+    .lag-bar-bg { background: var(--surface-2); border-radius: 6px; height: 8px; overflow: hidden; }
+    .lag-bar-fill {
+      height: 100%; border-radius: 6px;
+      transition: width .4s cubic-bezier(.4,0,.2,1);
+    }
+    .lag-bar-fill.low { background: linear-gradient(90deg, var(--green), #6ee7b7); }
+    .lag-bar-fill.med { background: linear-gradient(90deg, var(--amber), #fcd34d); }
+    .lag-bar-fill.high { background: linear-gradient(90deg, var(--red), #fda4af); }
+
+    .timer-section { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.25rem; }
+    .timer-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .3rem; text-align: center; }
+    .timer-value {
+      font-family: 'Red Hat Mono', monospace; font-size: 2.5rem; font-weight: 700;
+      font-variant-numeric: tabular-nums; line-height: 1;
+    }
+    .timer-value.running { animation: timer-pulse 1s ease infinite; }
+    @keyframes timer-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .6; }
+    }
+    .timer-sub { font-size: .65rem; color: var(--text-dim); }
+    .timer-sub .msgs { font-family: 'Red Hat Mono', monospace; font-weight: 600; color: var(--text); }
+    .run-history { display: flex; flex-direction: column; gap: .35rem; }
+    .run-history-title {
+      font-size: .6rem; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--text-dim); font-weight: 600; margin-bottom: .2rem;
+    }
+    .run-row {
+      display: flex; justify-content: space-between; align-items: center;
+      font-family: 'Red Hat Mono', monospace; font-size: .7rem;
+      padding: .35rem .6rem; border-radius: 6px;
+      background: var(--surface-2); border: 1px solid var(--border);
+    }
+    .run-row .run-num { color: var(--text-dim); font-size: .6rem; }
+    .run-row .run-time { font-weight: 700; }
+    .run-row .run-msgs { color: var(--text-dim); font-size: .6rem; }
+    .run-row:first-child { border-color: rgba(129,140,248,.3); background: rgba(129,140,248,.06); }
+    .run-empty { font-size: .7rem; color: var(--text-dim); text-align: center; padding: .75rem; }
+
+    .chart-wrap { margin-top: 1rem; }
+    .chart-wrap canvas { width: 100% !important; height: 140px !important; }
+
+    .timeline-box {
+      max-height: 140px; overflow-y: auto;
+      font-family: 'Red Hat Mono', monospace; font-size: .68rem;
+      line-height: 1.7; padding: .7rem; background: var(--surface-2); border-radius: var(--radius-sm);
+    }
+    .ev { display: flex; gap: .5rem; }
+    .ev .t { color: var(--text-dim); opacity: .4; white-space: nowrap; }
+    .ev.added .m { color: var(--green); }
+    .ev.removed .m { color: var(--red); }
+    .ev.info .m { color: var(--cyan); }
+    .ev.warn .m { color: var(--amber); }
+
+    .pods-list { display: flex; flex-direction: column; gap: .5rem; }
+    .pod-card {
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: .85rem;
+      transition: all .3s cubic-bezier(.4,0,.2,1);
+    }
+    .pod-enter { animation: pod-in .4s cubic-bezier(.4,0,.2,1); }
+    @keyframes pod-in { from { opacity: 0; transform: translateY(8px) scale(.96); } }
+    .pod-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: .4rem; }
+    .pod-name {
+      font-family: 'Red Hat Mono', monospace; font-size: .65rem;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px;
+    }
+    .pod-phase {
+      font-size: .55rem; text-transform: uppercase; letter-spacing: .06em;
+      padding: .15rem .45rem; border-radius: 4px; font-weight: 700;
+    }
+    .pod-phase.running { background: var(--green-soft); color: var(--green); }
+    .pod-phase.pending { background: var(--amber-soft); color: var(--amber); }
+    .pod-phase.containercreating { background: var(--cyan-soft); color: var(--cyan); }
+    .pod-phase.terminating { background: var(--red-soft); color: var(--red); }
+    .pod-info { font-size: .65rem; color: var(--text-dim); display: flex; gap: .75rem; align-items: center; }
+    .pod-dot { width: 5px; height: 5px; border-radius: 50%; display: inline-block; margin-right: .2rem; }
+    .pod-dot.up { background: var(--green); box-shadow: 0 0 4px var(--green); }
+    .pod-dot.down { background: var(--amber); animation: blink 1s infinite; }
+    @keyframes blink { 50% { opacity: .3; } }
+    .pods-empty {
+      font-size: .72rem; color: var(--text-dim); text-align: center;
+      padding: 1.25rem .5rem; line-height: 1.7;
+    }
+    .pods-empty-icon { font-size: 1.5rem; margin-bottom: .3rem; opacity: .3; }
+
+    .fade-enter-active { transition: all .3s ease; }
+    .fade-enter-from { opacity: 0; transform: translateY(4px); }
+
+    @media (max-width: 900px) {
+      .app { padding: 1.25rem; max-width: 100%; }
+      .main-layout { grid-template-columns: 1fr; }
+      .pods-sidebar { position: static; max-height: none; }
+      .grid-top { grid-template-columns: 1fr; }
+      .live-stats { grid-template-columns: repeat(3, 1fr); }
+      .partitions-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    </style>
+    </head>
+    <body>
+    <div id="app">
+      <div class="app">
+        <header>
+          <img src="/logo.png" alt="Red Hat">
+          <h1><em>KEDA</em> Kafka Scaling Demo</h1>
+          <p>Consumers auto-scale from zero based on Kafka consumer group lag</p>
+        </header>
+
+        <div class="main-layout">
+          <div class="main-content">
+            <div class="grid-top">
+              <div class="stat-cards">
+                <div class="glass">
+                  <div class="card-label">Consumers</div>
+                  <div class="card-value v-accent">{{ deployment.ready }}</div>
+                  <div class="card-sub">desired: {{ deployment.desired }}</div>
+                </div>
+                <div class="glass ticker-card">
+                  <div class="card-label">Messages Produced</div>
+                  <div class="ticker">
+                    <div v-for="(d, i) in tickerDigits" :key="d.key"
+                         class="ticker-slot digit">
+                      <transition name="roll" mode="out-in">
+                        <span :key="d.ch" class="ticker-ch">{{ d.ch }}</span>
+                      </transition>
+                    </div>
+                  </div>
+                  <div class="card-sub">uptime: {{ uptimeStr }}</div>
+                </div>
+                <div class="glass gauge-wrap">
+                  <div class="card-label">Consumer Progress</div>
+                  <div class="gauge" :style="{background: gaugeGradient}">
+                    <div class="gauge-inner">
+                      <div class="gauge-pct" :class="progressColor">{{ progressPct }}%</div>
+                      <div class="gauge-pct-label">consumed</div>
+                    </div>
+                  </div>
+                  <div class="gauge-legend">
+                    <span><span class="gauge-legend-dot" style="background:var(--green)"></span>Consumed</span>
+                    <span><span class="gauge-legend-dot" style="background:var(--amber)"></span>Lag</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="glass keda-panel">
+                <div class="keda-label">KEDA Autoscaler</div>
+                <div class="keda-badge on">
+                  <span class="keda-dot"></span>
+                  Active
+                </div>
+                <div class="keda-desc">
+                  Monitoring: <code>kafka lag &gt; {{ LAG_THRESHOLD }}</code><br>
+                  Consumers scale when consumer group lag exceeds threshold.
+                </div>
+                <div class="produce-controls">
+                  <div class="control-group-label">Produce Messages</div>
+                  <div class="produce-buttons">
+                    <button class="btn-produce" @click="produceMessages(25)" :disabled="false">+25</button>
+                    <button class="btn-produce" @click="produceMessages(50)" :disabled="false">+50</button>
+                    <button class="btn-produce" @click="produceMessages(100)" :disabled="false">+100</button>
+                    <button class="btn-produce" @click="produceMessages(500)" :disabled="false">+500</button>
+                    <button class="btn-produce" @click="produceMessages(1000)" :disabled="false">+1000</button>
+                  </div>
+                  <button class="btn-clear" @click="clearStats">Clear Stats</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="timer-section">
+              <div class="glass timer-card">
+                <div class="card-label">Time to Completion</div>
+                <div :class="['timer-value', timerAnimClass, timerColor]">
+                  {{ timerDisplay }}
+                </div>
+                <div class="timer-sub">{{ timerStatusText }}</div>
+              </div>
+              <div class="glass">
+                <div class="run-history-title">Run History</div>
+                <div class="run-history" v-if="runHistory.length > 0">
+                  <div v-for="(run, i) in runHistory" :key="i" class="run-row">
+                    <span class="run-num">#{{ runHistory.length - i }}</span>
+                    <span class="run-time" :class="i === 0 ? 'v-accent' : ''">{{ run.elapsed }}s</span>
+                    <span class="run-msgs">{{ run.messages }} msgs / {{ run.consumers || '?' }} pods</span>
+                  </div>
+                </div>
+                <div v-else class="run-empty">No completed runs yet</div>
+              </div>
+            </div>
+
+            <div class="glass section">
+              <div class="section-title">Consumer Lag</div>
+              <div class="live-stats">
+                <div :class="['live-stat', {'lag-alert': lagData.total_lag > 0 && deployment.ready === 0}]">
+                  <div class="live-stat-value v-amber">{{ lagData.total_lag }}</div>
+                  <div class="live-stat-label">Total Lag</div>
+                  <div class="threshold-label">threshold: <span>{{ LAG_THRESHOLD }}</span></div>
+                </div>
+                <div class="live-stat">
+                  <div class="live-stat-value v-cyan">{{ lagData.total_messages }}</div>
+                  <div class="live-stat-label">Total Messages</div>
+                </div>
+                <div class="live-stat">
+                  <div class="live-stat-value v-green">{{ consumed }}</div>
+                  <div class="live-stat-label">Consumed</div>
+                </div>
+              </div>
+              <div class="partitions-grid">
+                <div v-for="p in lagData.partitions" :key="p.partition"
+                     :class="['partition-card', {'has-lag': p.lag > 0}]">
+                  <div class="partition-id">P{{ p.partition }}</div>
+                  <div class="partition-lag" :class="p.lag > 0 ? 'v-amber' : 'v-green'">{{ p.lag }}</div>
+                  <div class="partition-offsets">{{ p.committed_offset }} / {{ p.end_offset }}</div>
+                </div>
+              </div>
+              <div class="lag-bar-wrap">
+                <div class="lag-bar-label">
+                  <span>Lag Pressure</span>
+                  <span>{{ lagData.total_lag }} messages behind</span>
+                </div>
+                <div class="lag-bar-bg">
+                  <div :class="['lag-bar-fill', lagLevel]"
+                       :style="{width: lagBarPct + '%'}"></div>
+                </div>
+              </div>
+              <div class="chart-wrap">
+                <canvas ref="chartCanvas"></canvas>
+              </div>
+            </div>
+
+            <div class="glass section">
+              <div class="section-title">Timeline</div>
+              <div class="timeline-box" ref="timeline">
+                <div v-for="(ev, i) in events" :key="i" :class="['ev', ev.cls]">
+                  <span class="t">{{ ev.time }}</span>
+                  <span class="m">{{ ev.msg }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="glass pods-sidebar">
+            <div class="section-title">
+              Consumers <span class="badge">{{ pods.length }}</span>
+            </div>
+            <div class="pods-list">
+              <div v-for="p in pods" :key="p.name" class="pod-card pod-enter">
+                <div class="pod-header">
+                  <span class="pod-name">{{ p.name }}</span>
+                  <span :class="['pod-phase', p.phase.toLowerCase().replace(/\s/g,'')]">
+                    {{ p.phase }}
+                  </span>
+                </div>
+                <div class="pod-info">
+                  <span>
+                    <span :class="['pod-dot', p.ready ? 'up' : 'down']"></span>
+                    {{ p.ready ? 'Ready' : 'Not Ready' }}
+                  </span>
+                  <span>Age: {{ timeSince(p.created) }}</span>
+                </div>
+              </div>
+              <div v-if="pods.length === 0" class="pods-empty">
+                <div class="pods-empty-icon">0</div>
+                No consumers running.<br>
+                KEDA will scale from zero<br>when lag appears.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+    const { createApp, ref, reactive, computed, onMounted, onUnmounted, nextTick } = Vue;
+
+    createApp({
+      setup() {
+        const LAG_THRESHOLD = 50;
+        const lagData = reactive({ partitions: [], total_lag: 0, total_messages: 0 });
+        const deployment = reactive({ ready: 0, desired: 0 });
+        const pods = ref([]);
+        const kedaPaused = ref(true);
+        const producing = ref(false);
+        const totalProduced = ref(0);
+        const events = reactive([]);
+        const knownPods = new Set();
+        const chartCanvas = ref(null);
+        const timeline = ref(null);
+        let chart = null;
+        let intervals = [];
+        let uptimeSeconds = ref(0);
+        const timerElapsed = ref(0);
+        const timerState = ref('idle');
+        const timerMessages = ref(0);
+        const timerConsumers = ref(0);
+        const runHistory = ref([]);
+
+        const timerDisplay = computed(() => {
+          if (timerState.value === 'idle') return '--.-s';
+          if (timerState.value === 'waiting') return '--.-s';
+          return timerElapsed.value.toFixed(1) + 's';
+        });
+
+        const timerStatusText = computed(() => {
+          if (timerState.value === 'idle') return 'Produce messages to start';
+          if (timerState.value === 'waiting') return 'Waiting for consumers to scale up...';
+          if (timerState.value === 'processing') return timerMessages.value + ' messages — ' + timerConsumers.value + ' consumer(s)';
+          if (timerState.value === 'done') return timerMessages.value + ' messages — ' + msgPerSec.value + ' msg/s (peak: ' + timerConsumers.value + ' consumers)';
+          return '';
+        });
+
+        const timerColor = computed(() => {
+          if (timerState.value === 'processing') return 'v-amber';
+          if (timerState.value === 'done') return 'v-green';
+          if (timerState.value === 'waiting') return 'v-cyan';
+          return 'v-accent';
+        });
+
+        const timerAnimClass = computed(() => {
+          if (timerState.value === 'processing') return 'running';
+          if (timerState.value === 'waiting') return 'running';
+          return '';
+        });
+
+        const msgPerSec = computed(() => {
+          if (timerElapsed.value === 0) return '0';
+          return (timerMessages.value / timerElapsed.value).toFixed(1);
+        });
+
+        const uptimeStr = computed(() => {
+          const m = Math.floor(uptimeSeconds.value / 60);
+          const s = Math.floor(uptimeSeconds.value % 60);
+          return m + 'm ' + s + 's';
+        });
+
+        const consumed = computed(() => {
+          return Math.max(0, lagData.total_messages - lagData.total_lag);
+        });
+
+        const progressPct = computed(() => {
+          if (lagData.total_messages === 0) return 100;
+          return Math.round(consumed.value / lagData.total_messages * 100);
+        });
+
+        const progressColor = computed(() => {
+          const p = progressPct.value;
+          if (p >= 90) return 'v-green';
+          if (p >= 40) return 'v-amber';
+          return 'v-red';
+        });
+
+        const gaugeGradient = computed(() => {
+          const pct = progressPct.value;
+          const deg = Math.round(pct * 3.6);
+          return 'conic-gradient(var(--green) 0deg, var(--green) ' + deg + 'deg, var(--amber) ' + deg + 'deg, var(--amber) 360deg)';
+        });
+
+        const lagBarPct = computed(() => {
+          if (lagData.total_lag === 0) return 0;
+          const max = Math.max(lagData.total_messages, 100);
+          return Math.min(100, Math.round(lagData.total_lag / max * 100));
+        });
+
+        const lagLevel = computed(() => {
+          const lag = lagData.total_lag;
+          if (lag <= LAG_THRESHOLD) return 'low';
+          if (lag <= LAG_THRESHOLD * 5) return 'med';
+          return 'high';
+        });
+
+        const tickerDigits = computed(() => {
+          const s = String(totalProduced.value);
+          const padded = s.padStart(4, '0');
+          return padded.split('').map((ch, i) => ({ ch, key: i }));
+        });
+
+        function timeSince(iso) {
+          const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+          if (s < 60) return s + 's';
+          if (s < 3600) return Math.floor(s / 60) + 'm';
+          return Math.floor(s / 3600) + 'h';
+        }
+
+        function tlog(msg, cls) {
+          events.push({ time: new Date().toLocaleTimeString(), msg, cls: cls || '' });
+          if (events.length > 100) events.splice(0, events.length - 80);
+          nextTick(() => { if (timeline.value) timeline.value.scrollTop = timeline.value.scrollHeight; });
+        }
+
+        async function fetchLag() {
+          try {
+            const d = await (await fetch('/lag')).json();
+            lagData.partitions = d.partitions || [];
+            lagData.total_lag = d.total_lag || 0;
+            lagData.total_messages = d.total_messages || 0;
+            totalProduced.value = d.total_produced || 0;
+            uptimeSeconds.value = d.uptime_seconds || 0;
+            const prevState = timerState.value;
+            timerElapsed.value = d.timer_elapsed || 0;
+            timerState.value = d.timer_state || 'idle';
+            timerMessages.value = d.timer_messages || 0;
+            timerConsumers.value = d.timer_consumers || 0;
+            if (d.timer_history) runHistory.value = [...d.timer_history].reverse();
+            if (prevState === 'processing' && timerState.value === 'done') {
+              tlog('Completed in ' + timerElapsed.value + 's (' + msgPerSec.value + ' msg/s, peak ' + timerConsumers.value + ' consumers)', 'added');
+            }
+            if (prevState !== 'waiting' && timerState.value === 'waiting') {
+              tlog('Waiting for consumers to scale up...', 'warn');
+            }
+            if (prevState === 'waiting' && timerState.value === 'processing') {
+              tlog('Consumers started — processing timer started', 'info');
+            }
+          } catch(e) {}
+        }
+
+        async function fetchPods() {
+          try {
+            const d = await (await fetch('/pods')).json();
+            deployment.ready = d.deployment.ready || 0;
+            deployment.desired = d.deployment.desired;
+            const current = new Set(d.pods.map(p => p.name));
+            for (const name of knownPods) {
+              if (!current.has(name)) {
+                knownPods.delete(name);
+                tlog('Consumer removed: ' + name.split('-').pop(), 'removed');
+              }
+            }
+            d.pods.forEach(p => {
+              if (!knownPods.has(p.name)) {
+                tlog('Consumer added: ' + p.name.split('-').pop() + ' (' + p.phase + ')', 'added');
+                knownPods.add(p.name);
+              }
+            });
+            pods.value = d.pods;
+          } catch(e) {}
+        }
+
+        async function fetchKeda() {
+          try {
+            const d = await (await fetch('/keda-status')).json();
+            kedaPaused.value = d.paused;
+          } catch(e) {}
+        }
+
+        async function toggleKeda() {
+          const action = kedaPaused.value ? 'enable' : 'disable';
+          kedaPaused.value = !kedaPaused.value;
+          tlog(action === 'enable' ? 'KEDA autoscaler ENABLED' : 'KEDA autoscaler DISABLED', 'info');
+          try {
+            await fetch('/keda-toggle?action=' + action, {method: 'POST'});
+          } catch(e) {
+            kedaPaused.value = !kedaPaused.value;
+            tlog('Failed to toggle KEDA', 'warn');
+          }
+          fetchKeda();
+        }
+
+        async function clearStats() {
+          tlog('Clearing stats...', 'info');
+          try {
+            await fetch('/clear-stats', {method: 'POST'});
+            totalProduced.value = 0;
+            tlog('Stats cleared', 'removed');
+            fetchLag();
+          } catch(e) {
+            tlog('Failed to clear stats', 'warn');
+          }
+        }
+
+        async function produceMessages(count) {
+          tlog('Producing ' + count + ' messages...', 'info');
+          try {
+            const r = await (await fetch('/produce?count=' + count, {method: 'POST'})).json();
+            if (r.ok) {
+              tlog(count + ' messages queued to Kafka', 'added');
+            } else {
+              tlog('Failed: ' + (r.error || 'unknown'), 'warn');
+            }
+          } catch(e) {
+            tlog('Failed to produce messages', 'warn');
+          }
+          for (let i = 0; i < 5; i++) {
+            setTimeout(() => { fetchLag().then(updateChart); }, (i + 1) * 500);
+          }
+        }
+
+        function initChart() {
+          if (!chartCanvas.value) return;
+          const ctx = chartCanvas.value.getContext('2d');
+          chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: [],
+              datasets: [
+                {
+                  label: 'Consumer Lag', data: [], borderColor: '#fbbf24',
+                  backgroundColor: 'rgba(251,191,36,.08)', fill: true,
+                  tension: .4, pointRadius: 0, borderWidth: 2,
+                },
+                {
+                  label: 'Threshold', data: [], borderColor: 'rgba(251,191,36,.5)',
+                  backgroundColor: 'transparent', fill: false,
+                  borderDash: [6, 4], tension: 0, pointRadius: 0, borderWidth: 1.5,
+                },
+                {
+                  label: 'Consumers', data: [], borderColor: '#818cf8',
+                  backgroundColor: 'rgba(129,140,248,.08)', fill: true,
+                  tension: .4, pointRadius: 0, borderWidth: 2, yAxisID: 'y1',
+                },
+              ],
+            },
+            options: {
+              responsive: true, maintainAspectRatio: false,
+              animation: { duration: 300 },
+              interaction: { mode: 'index', intersect: false },
+              plugins: {
+                legend: {
+                  labels: { color: 'rgba(255,255,255,.45)', font: { family: 'Red Hat Display', size: 10 }, boxWidth: 12, padding: 12 },
+                },
+              },
+              scales: {
+                x: { display: false },
+                y: {
+                  position: 'left', beginAtZero: true,
+                  grid: { color: 'rgba(255,255,255,.04)' },
+                  ticks: { color: 'rgba(255,255,255,.3)', font: { size: 10 } },
+                  title: { display: true, text: 'consumer lag', color: 'rgba(255,255,255,.3)', font: { size: 10 } },
+                },
+                y1: {
+                  position: 'right', beginAtZero: true,
+                  grid: { drawOnChartArea: false },
+                  ticks: { color: 'rgba(129,140,248,.5)', font: { size: 10 }, stepSize: 1 },
+                  title: { display: true, text: 'consumers', color: 'rgba(129,140,248,.5)', font: { size: 10 } },
+                },
+              },
+            },
+          });
+        }
+
+        function updateChart() {
+          if (!chart) return;
+          const now = new Date().toLocaleTimeString();
+          chart.data.labels.push(now);
+          chart.data.datasets[0].data.push(lagData.total_lag);
+          chart.data.datasets[1].data.push(LAG_THRESHOLD);
+          chart.data.datasets[2].data.push(deployment.ready);
+
+          const maxPts = 60;
+          if (chart.data.labels.length > maxPts) {
+            chart.data.labels.splice(0, chart.data.labels.length - maxPts);
+            chart.data.datasets.forEach(ds => ds.data.splice(0, ds.data.length - maxPts));
+          }
+          chart.update('none');
+        }
+
+        onMounted(() => {
+          fetchLag(); fetchPods(); fetchKeda();
+          initChart();
+          intervals.push(setInterval(() => { fetchLag().then(updateChart); }, 2000));
+          intervals.push(setInterval(fetchPods, 2000));
+          intervals.push(setInterval(fetchKeda, 3000));
+        });
+
+        onUnmounted(() => intervals.forEach(clearInterval));
+
+        return {
+          LAG_THRESHOLD, lagData, deployment, pods, kedaPaused, producing,
+          totalProduced, events, uptimeStr, consumed, progressPct,
+          progressColor, gaugeGradient, lagBarPct, lagLevel,
+          tickerDigits, chartCanvas, timeline,
+          timerElapsed, timerState, timerMessages, timerConsumers, timerDisplay, timerStatusText, timerColor, timerAnimClass, msgPerSec, runHistory,
+          timeSince, toggleKeda, produceMessages, clearStats,
+        };
+      },
+    }).mount('#app');
+    </script>
+    </body>
+    </html>'''
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/healthz':
+                self._ok(b'ok')
+                return
+
+            if self.path == '/logo.png':
+                try:
+                    with open('/logo/rhlogo.png', 'rb') as f:
+                        data = f.read()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/png')
+                    self.send_header('Cache-Control', 'public, max-age=86400')
+                    self.end_headers()
+                    self.wfile.write(data)
+                except FileNotFoundError:
+                    self.send_response(404)
+                    self.end_headers()
+                return
+
+            if self.path == '/lag':
+                try:
+                    lag = get_consumer_lag()
+                    lag['uptime_seconds'] = round(time.time() - start_time, 1)
+                    with produce_stats['lock']:
+                        lag['total_produced'] = produce_stats['total_produced']
+                    try:
+                        dep = get_deployment()
+                        ready_consumers = dep.get('ready', 0)
+                    except Exception:
+                        ready_consumers = 0
+                    with run_timer['lock']:
+                        now = time.time()
+                        run_timer['peak_consumers'] = max(run_timer['peak_consumers'], ready_consumers)
+                        if run_timer['produce_time'] and run_timer['run_end'] is None:
+                            if run_timer['processing_start'] is None and ready_consumers > 0:
+                                run_timer['processing_start'] = now
+                                run_timer['run_messages'] = lag['total_lag']
+                            if run_timer['processing_start'] and lag['total_lag'] == 0:
+                                run_timer['run_end'] = now
+                                elapsed = round(run_timer['run_end'] - run_timer['processing_start'], 1)
+                                run_timer['history'].append({
+                                    'elapsed': elapsed,
+                                    'messages': run_timer['run_messages'],
+                                    'consumers': run_timer['peak_consumers'],
+                                })
+                                if len(run_timer['history']) > 10:
+                                    run_timer['history'] = run_timer['history'][-10:]
+                        if run_timer['produce_time'] is None:
+                            lag['timer_state'] = 'idle'
+                            lag['timer_elapsed'] = 0
+                        elif run_timer['run_end']:
+                            lag['timer_state'] = 'done'
+                            lag['timer_elapsed'] = round(run_timer['run_end'] - run_timer['processing_start'], 1)
+                        elif run_timer['processing_start']:
+                            lag['timer_state'] = 'processing'
+                            lag['timer_elapsed'] = round(now - run_timer['processing_start'], 1)
+                        else:
+                            lag['timer_state'] = 'waiting'
+                            lag['timer_elapsed'] = 0
+                        lag['timer_messages'] = run_timer['run_messages']
+                        lag['timer_consumers'] = run_timer['peak_consumers']
+                        lag['timer_history'] = list(run_timer['history'])
+                    self._json(lag)
+                except Exception as e:
+                    self._json({'error': str(e)}, 500)
+                return
+
+            if self.path == '/pods':
+                try:
+                    self._json({'pods': get_pods(), 'deployment': get_deployment()})
+                except Exception as e:
+                    self._json({'error': str(e)}, 500)
+                return
+
+            if self.path == '/keda-status':
+                try:
+                    self._json(get_keda_status())
+                except Exception as e:
+                    self._json({'paused': True, 'error': str(e)})
+                return
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML.encode())
+
+        def do_POST(self):
+            if self.path == '/clear-stats':
+                with produce_stats['lock']:
+                    produce_stats['total_produced'] = 0
+                with run_timer['lock']:
+                    run_timer['produce_time'] = None
+                    run_timer['processing_start'] = None
+                    run_timer['run_end'] = None
+                    run_timer['run_messages'] = 0
+                    run_timer['initial_lag'] = 0
+                    run_timer['peak_consumers'] = 0
+                try:
+                    consumer = KafkaConsumer(
+                        bootstrap_servers=KAFKA_BOOTSTRAP,
+                        group_id=KAFKA_GROUP,
+                        enable_auto_commit=False,
+                    )
+                    partitions = consumer.partitions_for_topic(KAFKA_TOPIC)
+                    if partitions:
+                        tps = [TopicPartition(KAFKA_TOPIC, p) for p in partitions]
+                        end_offsets = consumer.end_offsets(tps)
+                        for tp, offset in end_offsets.items():
+                            consumer.commit({tp: OffsetAndMetadata(offset, '')})
+                    consumer.close()
+                except Exception:
+                    pass
+                self._json({'ok': True})
+                return
+
+            if self.path.startswith('/produce'):
+                count = 50
+                if '?' in self.path:
+                    params = dict(p.split('=') for p in self.path.split('?')[1].split('&') if '=' in p)
+                    count = min(int(params.get('count', 50)), 500)
+                try:
+                    result = produce_messages(count)
+                    self._json(result)
+                except Exception as e:
+                    self._json({'ok': False, 'error': str(e)}, 500)
+                return
+
+            if self.path.startswith('/keda-toggle'):
+                action = 'enable'
+                if '?' in self.path:
+                    params = dict(p.split('=') for p in self.path.split('?')[1].split('&') if '=' in p)
+                    action = params.get('action', 'enable')
+                try:
+                    set_keda_paused(action == 'disable')
+                    self._json({'ok': True, 'action': action})
+                except Exception as e:
+                    self._json({'error': str(e)}, 500)
+                return
+
+        def _ok(self, body):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, data, code=200):
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadedHTTPServer(('', 8080), Handler)
+    print(f"Kafka dashboard on :8080 (pod: {hostname})")
+    server.serve_forever()

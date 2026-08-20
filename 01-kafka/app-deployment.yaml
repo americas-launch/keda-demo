@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kafka-app-sa
+  namespace: keda-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kafka-app-role
+  namespace: keda-demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kafka-app-binding
+  namespace: keda-demo
+subjects:
+  - kind: ServiceAccount
+    name: kafka-app-sa
+    namespace: keda-demo
+roleRef:
+  kind: Role
+  name: kafka-app-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-app
+  namespace: keda-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-app
+  template:
+    metadata:
+      labels:
+        app: kafka-app
+    spec:
+      serviceAccountName: kafka-app-sa
+      containers:
+        - name: app
+          image: python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              pip install --quiet --user kafka-python && python3 -u /app/server.py
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 8
+          env:
+            - name: HOME
+              value: /tmp
+            - name: KAFKA_BOOTSTRAP
+              value: lightwell-kafka-bootstrap.lightwell-infra.svc:9092
+            - name: KAFKA_TOPIC
+              value: keda-demo-orders
+            - name: KAFKA_GROUP
+              value: keda-demo-consumer-group
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+            - name: logo
+              mountPath: /logo
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: app-code
+          configMap:
+            name: kafka-app-code
+        - name: logo
+          configMap:
+            name: http-app-logo
